@@ -9,6 +9,7 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
+from .levels import FLOWER_AMOUNT, LEVEL_JOININGS, cycle_status, level_for_joinings, next_level_target, task_rate
 from .models import (
     Channel, ContactAdmin, Deposit, Gateway, Plan, Reward, SiteSetting,
     Task, TaskDone, Transaction, UpgradeRequest, User, Withdrawal,
@@ -116,20 +117,99 @@ def approved_withdrawals_today(user):
     return approved.filter(Q(updated_at__date=today) | Q(updated_at__isnull=True, created_at__date=today))
 
 
+def approved_joinings(user):
+    return user.team.filter(plan__isnull=False, account_status="approved")
+
+
+def sync_level(user):
+    if not user or getattr(user, "role", "") != "user":
+        return 0
+    count = approved_joinings(user).count()
+    level = level_for_joinings(count)
+    if user.level != level:
+        user.level = level
+        user.save(update_fields=["level"])
+    return count
+
+
+def credit_flower_once(user):
+    if user.flower_credited:
+        return
+    user.flower_balance += FLOWER_AMOUNT
+    user.flower_credited = True
+    user.save(update_fields=["flower_balance", "flower_credited"])
+    Transaction.objects.create(user=user, amount=FLOWER_AMOUNT, trx_type="+", title="Flower Earning", remark="flower")
+
+
+def activate_member(user):
+    if user.activated_at is None:
+        user.activated_at = timezone.now()
+        user.save(update_fields=["activated_at"])
+    credit_flower_once(user)
+    sync_level(user)
+    if user.referred_by_id:
+        sync_level(user.referred_by)
+
+
+def joining_clock(user, count):
+    latest = None
+    for member in approved_joinings(user).only("activated_at", "date_joined"):
+        stamp = member.activated_at or member.date_joined
+        if latest is None or stamp > latest:
+            latest = stamp
+    started = user.activated_at or user.date_joined
+    return cycle_status(user.level, count, started, latest, timezone.now())
+
+
+def progress_payload(user, count):
+    clock = joining_clock(user, count)
+    next_level, required = next_level_target(user.level)
+    if not user.plan_id:
+        locked = True
+        message = "Tasks are locked until your package payment is approved."
+    elif clock["locked"]:
+        locked = True
+        message = f"Tasks are locked because no approved joining arrived in the last {clock['days']} days. When a new member's payment is approved, tasks unlock and the next cycle starts."
+    else:
+        locked = False
+        message = f"Tasks are unlocked. Complete an approved joining within {clock['days']} days to keep them open."
+    return {
+        "level": user.level,
+        "joinings": count,
+        "next_level": next_level,
+        "next_required": required,
+        "task_rate": money(task_rate(user.level)),
+        "daily_limit": user.plan.daily_tasks if user.plan else 0,
+        "locked": locked,
+        "task_status": "Locked" if locked else "Unlocked",
+        "message": message,
+        "cycle_days": clock["days"],
+        "remaining_seconds": 0 if locked or not user.plan_id else clock["remaining"],
+        "flower_balance": money(user.flower_balance),
+        "flower_locked": user.level < 8,
+    }
+    today = timezone.localdate()
+    approved = user.withdrawals.filter(status=Withdrawal.APPROVED)
+    return approved.filter(Q(updated_at__date=today) | Q(updated_at__isnull=True, created_at__date=today))
+
+
 @api_view(["GET"])
 def user_home(request):
     user = request.user
     settings = SiteSetting.current()
+    count = sync_level(user)
     done = TaskDone.objects.filter(user=user, created_at__date=timezone.localdate()).count()
     txs = user.transactions.all()
+    progress = progress_payload(user, count)
     return Response({
         "user": user_payload(user),
         "notice": settings.notice,
         "referral_link": request.build_absolute_uri(f"/register?ref={user.referral_code}"),
         "tasks_today": done,
-        "daily_limit": user.plan.daily_tasks if user.plan else 0,
+        "daily_limit": progress["daily_limit"],
         "team_total": user.team.count(),
-        "active_team": user.team.filter(plan__isnull=False).count(),
+        "active_team": count,
+        "progress": progress,
         "earnings": {
             "total": earning_total(txs.filter(trx_type="+")),
             "direct": earning_total(txs.filter(remark="referral", level=1)),
@@ -146,32 +226,58 @@ def user_home(request):
             "indirect": earning_total(txs.filter(remark="referral", level__in=[2, 3])),
             "indirect_level2": earning_total(txs.filter(remark="referral", level=2)),
             "indirect_level3": earning_total(txs.filter(remark="referral", level=3)),
-            "flowers": earning_total(txs.filter(remark="ads")),
+            "flowers": money(user.flower_balance),
+            "flower_locked": user.level < 8,
         },
     })
 
 
 @api_view(["GET"])
 def tasks(request):
-    done_ids = set(TaskDone.objects.filter(user=request.user).values_list("task_id", flat=True))
+    user = request.user
+    count = sync_level(user)
+    progress = progress_payload(user, count)
+    today = timezone.localdate()
+    done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
+    catalog = list(Task.objects.filter(active=True))
+    if not catalog:
+        catalog = [Task.objects.create(title="Daily task", detail="Complete today's assigned task.", reward=0, active=True)]
+    limit = progress["daily_limit"]
+    rate = progress["task_rate"]
     rows = []
-    for task in Task.objects.filter(active=True):
-        rows.append({"id": task.id, "title": task.title, "detail": task.detail, "reward": money(task.reward), "done": task.id in done_ids})
-    return Response(rows)
+    for slot in range(limit):
+        task = catalog[slot % len(catalog)]
+        rows.append({
+            "id": task.id,
+            "slot": slot,
+            "title": task.title,
+            "detail": task.detail,
+            "reward": rate,
+            "done": slot < done_today,
+        })
+    return Response({"tasks": rows, "done_today": done_today, "progress": progress})
 
 
 @api_view(["POST"])
 def complete_task(request, pk):
+    user = request.user
+    count = sync_level(user)
+    progress = progress_payload(user, count)
+    if progress["locked"]:
+        return Response({"detail": progress["message"]}, status=400)
     task = Task.objects.filter(pk=pk, active=True).first()
     if not task:
         return Response({"detail": "Task not found."}, status=404)
-    if TaskDone.objects.filter(user=request.user, task=task).exists():
-        return Response({"detail": "This task is already complete."}, status=400)
-    TaskDone.objects.create(user=request.user, task=task)
-    request.user.balance += task.reward
-    request.user.save(update_fields=["balance"])
-    Transaction.objects.create(user=request.user, amount=task.reward, trx_type="+", title="Ads Earning", remark="ads", plan_name=request.user.plan.name if request.user.plan else "")
-    return Response({"balance": money(request.user.balance)})
+    today = timezone.localdate()
+    done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
+    if done_today >= progress["daily_limit"]:
+        return Response({"detail": "Today's task limit is complete."}, status=400)
+    reward = task_rate(user.level)
+    TaskDone.objects.create(user=user, task=task)
+    user.balance += reward
+    user.save(update_fields=["balance"])
+    Transaction.objects.create(user=user, amount=reward, trx_type="+", title="Task Earning", remark="ads", plan_name=user.plan.name if user.plan else "")
+    return Response({"balance": money(user.balance), "reward": money(reward)})
 
 
 @api_view(["GET"])
@@ -213,12 +319,19 @@ def team(request):
 
 @api_view(["GET"])
 def rewards(request):
-    active = request.user.team.filter(plan__isnull=False).count()
-    return Response({
-        "active_team": active,
-        "level": request.user.level,
-        "items": [{"id": r.id, "level": r.level, "title": r.title, "required_team": r.required_team, "prize": r.prize, "reached": active >= r.required_team} for r in Reward.objects.filter(active=True)],
-    })
+    user = request.user
+    count = sync_level(user)
+    items = []
+    for step, required in LEVEL_JOININGS.items():
+        items.append({
+            "id": step,
+            "level": step,
+            "title": f"Level {step}",
+            "required_team": required,
+            "prize": f"Rs {task_rate(step)} per task",
+            "reached": count >= required,
+        })
+    return Response({"active_team": count, "level": user.level, "task_rate": money(task_rate(user.level)), "items": items})
 
 
 @api_view(["GET"])
@@ -245,13 +358,17 @@ def withdrawals(request):
         account = (request.data.get("account") or "").strip()
         if amount <= 0 or not method or not account_name or not account:
             return Response({"detail": "Amount, method, account name, and account number are required."}, status=400)
-        if request.user.balance < amount:
+        sync_level(request.user)
+        flower_available = request.user.flower_balance if request.user.level >= 8 else Decimal("0")
+        if request.user.balance + flower_available < amount:
             return Response({"detail": "Not enough balance."}, status=400)
-        request.user.balance -= amount
-        request.user.save(update_fields=["balance"])
+        flower_part = amount - request.user.balance if amount > request.user.balance else Decimal("0")
+        request.user.balance -= amount - flower_part
+        request.user.flower_balance -= flower_part
+        request.user.save(update_fields=["balance", "flower_balance"])
         Withdrawal.objects.create(
             user=request.user, amount=amount, method=method, account_name=account_name,
-            account=account, updated_at=timezone.now(),
+            account=account, flower_part=flower_part, updated_at=timezone.now(),
         )
         Transaction.objects.create(user=request.user, amount=amount, trx_type="-", title="Withdraw", remark="withdraw")
         return Response({"balance": money(request.user.balance)})
@@ -606,8 +723,8 @@ def deposit_action(request, pk):
         deposit.save()
         deposit.user.plan = deposit.plan
         deposit.user.account_status = "approved"
-        deposit.user.level = max(deposit.user.level, 1)
         deposit.user.save()
+        activate_member(deposit.user)
         credit_referral(deposit)
     elif action == "reject":
         deposit.status = Deposit.REJECTED
@@ -650,8 +767,9 @@ def withdrawal_action(request, pk):
         row.updated_at = timezone.now()
     elif action == "reject":
         if row.status == Withdrawal.PENDING:
-            row.user.balance += row.amount
-            row.user.save(update_fields=["balance"])
+            row.user.balance += row.amount - row.flower_part
+            row.user.flower_balance += row.flower_part
+            row.user.save(update_fields=["balance", "flower_balance"])
         row.status = Withdrawal.REJECTED
         row.updated_at = timezone.now()
     row.save()
@@ -689,8 +807,8 @@ def upgrade_action(request, pk):
         row.status = UpgradeRequest.APPROVED
         row.user.plan = row.to_plan
         row.user.account_status = "approved"
-        row.user.level = max(row.user.level, 1)
-        row.user.save(update_fields=["plan", "account_status", "level"])
+        row.user.save(update_fields=["plan", "account_status", "activated_at", "flower_balance", "flower_credited", "level"])
+        activate_member(row.user)
         credit_referral_amount(row.user, row.amount, row.to_plan)
     elif request.data.get("action") == "reject":
         row.status = UpgradeRequest.REJECTED

@@ -27,6 +27,9 @@ class User(AbstractUser):
     referred_by = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="team")
     account_status = models.CharField(max_length=20, default="approved")
     level = models.PositiveIntegerField(default=0)
+    flower_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    flower_credited = models.BooleanField(default=False)
+    activated_at = models.DateTimeField(null=True, blank=True)
 
     def display_name(self):
         return self.full_name or self.username
@@ -96,7 +99,7 @@ class TaskDone(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = ("user", "task")
+        indexes = [models.Index(fields=["user", "created_at"], name="flower_taskdone_user_created")]
 
 
 class Deposit(models.Model):
@@ -123,6 +126,7 @@ class Withdrawal(models.Model):
     method = models.CharField(max_length=80)
     account_name = models.CharField(max_length=120, blank=True, default="")
     account = models.CharField(max_length=80)
+    flower_part = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     status = models.CharField(max_length=20, default=PENDING)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(null=True, blank=True)
