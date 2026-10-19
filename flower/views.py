@@ -102,7 +102,7 @@ def me(request):
     settings = SiteSetting.current()
     data = user_payload(request.user)
     data["notice"] = settings.notice
-    data["referral_link"] = f"http://localhost:5173/register?ref={request.user.referral_code}"
+    data["referral_link"] = request.build_absolute_uri(f"/register?ref={request.user.referral_code}")
     return Response(data)
 
 
@@ -119,7 +119,7 @@ def user_home(request):
     return Response({
         "user": user_payload(user),
         "notice": settings.notice,
-        "referral_link": f"http://localhost:5173/register?ref={user.referral_code}",
+        "referral_link": request.build_absolute_uri(f"/register?ref={user.referral_code}"),
         "tasks_today": done,
         "daily_limit": user.plan.daily_tasks if user.plan else 0,
         "team_total": user.team.count(),
@@ -130,6 +130,13 @@ def user_home(request):
             "indirect": earning_total(txs.filter(remark="referral", level__in=[2, 3])),
             "ads": earning_total(txs.filter(remark="ads")),
             "withdrawn": earning_total(txs.filter(remark="withdraw")),
+        },
+        "wallet": {
+            "withdrawn": earning_total(user.withdrawals.filter(status=Withdrawal.APPROVED)),
+            "pending": earning_total(user.withdrawals.filter(status=Withdrawal.PENDING)),
+            "rejected": earning_total(user.withdrawals.filter(status=Withdrawal.REJECTED)),
+            "staff": earning_total(txs.filter(remark="referral")),
+            "flowers": earning_total(txs.filter(remark="ads")),
         },
     })
 
@@ -338,14 +345,34 @@ def admin_summary(request):
     if not require_admin(request.user):
         return Response({"detail": "Admin only."}, status=403)
     today = timezone.localdate()
+    approved_deposits = Deposit.objects.filter(status=Deposit.APPROVED)
+    approved_withdrawals = Withdrawal.objects.filter(status=Withdrawal.APPROVED)
+    manual_add = Transaction.objects.filter(trx_type="+").exclude(remark__in=["referral", "ads"])
+    manual_sub = Transaction.objects.filter(trx_type="-").exclude(remark="withdraw")
+    task_earn = Transaction.objects.filter(remark="ads")
     return Response({
         "users": User.objects.filter(role="user").count(),
         "pending_deposits": Deposit.objects.filter(status=Deposit.PENDING).count(),
         "pending_withdrawals": Withdrawal.objects.filter(status=Withdrawal.PENDING).count(),
         "approved_today": Deposit.objects.filter(status=Deposit.APPROVED, updated_at__date=today).count(),
-        "withdraw_today": Withdrawal.objects.filter(status=Withdrawal.APPROVED, created_at__date=today).count(),
+        "withdraw_today": approved_withdrawals.filter(created_at__date=today).count(),
         "pending_upgrades": UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING).count(),
         "rejected_users": User.objects.filter(role="user", account_status="rejected").count(),
+        "money": {
+            "referral": money(_sum(Transaction.objects.filter(remark="referral"))),
+            "deposited": money(_sum(approved_deposits)),
+            "approved_users_today": User.objects.filter(role="user", deposits__status=Deposit.APPROVED, deposits__updated_at__date=today).distinct().count(),
+            "withdrawals_today": money(_sum(approved_withdrawals.filter(created_at__date=today))),
+            "received_today": money(_sum(approved_deposits.filter(updated_at__date=today))),
+            "withdrawn": money(_sum(approved_withdrawals)),
+            "task": money(_sum(task_earn)),
+            "task_today": money(_sum(task_earn.filter(created_at__date=today))),
+            "manual_add": money(_sum(manual_add)),
+            "manual_add_today": money(_sum(manual_add.filter(created_at__date=today))),
+            "manual_sub": money(_sum(manual_sub)),
+            "manual_sub_today": money(_sum(manual_sub.filter(created_at__date=today))),
+            "balances": money(_sum(User.objects.filter(role="user"), "balance")),
+        },
     })
 
 
@@ -508,6 +535,10 @@ def admin_transactions(request):
         qs = qs.filter(remark="withdraw")
     elif category == "ads":
         qs = qs.filter(remark="ads")
+    elif category == "manual_add":
+        qs = qs.filter(trx_type="+").exclude(remark__in=["referral", "ads"])
+    elif category == "manual_sub":
+        qs = qs.filter(trx_type="-").exclude(remark="withdraw")
     q = (request.GET.get("q") or "").strip()
     if q:
         qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(title__icontains=q) | Q(source_email__icontains=q))
