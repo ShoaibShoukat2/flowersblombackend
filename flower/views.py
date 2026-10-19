@@ -712,6 +712,7 @@ def admin_transactions(request):
     rows = []
     for tx in qs[:150]:
         item = tx_public(tx, include_email=True)
+        item["user_id"] = tx.user_id
         item["user_name"] = tx.user.display_name()
         item["user_email"] = tx.user.email
         rows.append(item)
