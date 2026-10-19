@@ -420,6 +420,8 @@ def deposit_create(request):
     method = (request.data.get("method") or "").strip()
     if not sender or not method:
         return Response({"detail": "Choose JazzCash or Easypaisa and enter the sender number."}, status=400)
+    if not request.FILES.get("screenshot"):
+        return Response({"detail": "Payment screenshot is required."}, status=400)
     if user.plan_id:
         if plan.id == user.plan_id:
             return Response({"detail": "This is already your current plan."}, status=400)
@@ -453,6 +455,8 @@ def upgrade_create(request):
     plan = Plan.objects.filter(pk=plan_id).first()
     if not plan:
         return Response({"detail": "Choose a plan."}, status=400)
+    if not request.FILES.get("screenshot"):
+        return Response({"detail": "Payment screenshot is required."}, status=400)
     UpgradeRequest.objects.create(
         user=request.user, from_plan=request.user.plan, to_plan=plan, amount=plan.price,
         method=(request.data.get("method") or "").strip(),
