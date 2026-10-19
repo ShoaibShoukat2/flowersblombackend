@@ -10,7 +10,7 @@ class Command(BaseCommand):
     help = "Load demo Flower data for the new React site. Does not touch Laravel."
 
     def handle(self, *args, **options):
-        if User.objects.filter(email="admin@flower.test").exists():
+        if User.objects.filter(role="admin").exists():
             self.stdout.write("Demo data already exists.")
             return
         SiteSetting.current()
@@ -24,8 +24,8 @@ class Command(BaseCommand):
         ]
         for i, (name, price, tasks, bg, fg) in enumerate(catalog):
             plans[name] = Plan.objects.create(name=name, price=Decimal(price), daily_tasks=tasks, color=bg, text_color=fg, sort_order=i)
-        admin = User(username="admin", email="admin@flower.test", full_name="Flower Admin", role="admin", referral_code="ADMIN", account_status="approved", is_staff=True)
-        admin.set_password("Admin123")
+        admin = User(username="admin", email="shoaib@gmail.com", full_name="Shoaib", role="admin", referral_code="ADMIN", account_status="approved", is_staff=True)
+        admin.set_password("shoaib123")
         admin.save()
 
         def make(name, email, code, plan, parent=None, status="approved"):
@@ -60,4 +60,4 @@ class Command(BaseCommand):
             Reward(level=2, title="Level 2", required_team=12, prize="Silver gift"),
             Reward(level=3, title="Level 3", required_team=27, prize="Gold gift"),
         ])
-        self.stdout.write("Demo ready. User aisha@flower.test / Flower123  Admin admin@flower.test / Admin123")
+        self.stdout.write("Demo ready. User aisha@flower.test / Flower123  Admin shoaib@gmail.com / shoaib123")

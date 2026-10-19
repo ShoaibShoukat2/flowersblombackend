@@ -1,3 +1,4 @@
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db.models import Count, Q, Sum
@@ -345,6 +346,55 @@ def admin_summary(request):
         "withdraw_today": Withdrawal.objects.filter(status=Withdrawal.APPROVED, created_at__date=today).count(),
         "pending_upgrades": UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING).count(),
         "rejected_users": User.objects.filter(role="user", account_status="rejected").count(),
+    })
+
+
+def _sum(qs, field="amount"):
+    return qs.aggregate(total=Sum(field))["total"] or Decimal("0")
+
+
+@api_view(["GET"])
+def admin_analytics(request):
+    if not require_admin(request.user):
+        return Response(status=403)
+    sales = _sum(Deposit.objects.filter(status=Deposit.APPROVED))
+    direct = _sum(Transaction.objects.filter(remark="referral", level=1))
+    indirect = _sum(Transaction.objects.filter(remark="referral", level__in=[2, 3]))
+    ads = _sum(Transaction.objects.filter(remark="ads"))
+    credited = direct + indirect + ads
+    withdrawn = _sum(Withdrawal.objects.filter(status=Withdrawal.APPROVED))
+    pending_withdraw = _sum(Withdrawal.objects.filter(status=Withdrawal.PENDING))
+    balances = _sum(User.objects.filter(role="user"), "balance")
+    profit = sales - credited
+    today = timezone.localdate()
+    days = []
+    for offset in range(6, -1, -1):
+        day = today - timedelta(days=offset)
+        days.append({
+            "label": day.strftime("%a"),
+            "sales": float(_sum(Deposit.objects.filter(status=Deposit.APPROVED, updated_at__date=day))),
+            "earnings": float(_sum(Transaction.objects.filter(trx_type="+", created_at__date=day))),
+            "withdrawals": float(_sum(Withdrawal.objects.filter(status=Withdrawal.APPROVED, created_at__date=day))),
+        })
+    return Response({
+        "sales": money(sales),
+        "direct": money(direct),
+        "indirect": money(indirect),
+        "ads": money(ads),
+        "credited": money(credited),
+        "withdrawn": money(withdrawn),
+        "pending_withdraw": money(pending_withdraw),
+        "balances": money(balances),
+        "profit": money(abs(profit)),
+        "result": "profit" if profit >= 0 else "loss",
+        "days": days,
+        "mix": [
+            {"label": "Plan sales", "value": float(sales)},
+            {"label": "Direct commission", "value": float(direct)},
+            {"label": "Indirect commission", "value": float(indirect)},
+            {"label": "Ads earning", "value": float(ads)},
+            {"label": "Withdrawn", "value": float(withdrawn)},
+        ],
     })
 
 

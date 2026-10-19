@@ -18,6 +18,7 @@ urlpatterns = [
     path("user/deposits", views.deposit_create),
     path("user/upgrades", views.upgrade_create),
     path("admin/summary", views.admin_summary),
+    path("admin/analytics", views.admin_analytics),
     path("admin/users", views.admin_users),
     path("admin/users/<int:pk>", views.admin_user_detail),
     path("admin/leaderboard", views.leaderboard),
