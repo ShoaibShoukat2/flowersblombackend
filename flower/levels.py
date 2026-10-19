@@ -37,7 +37,8 @@ def task_rate(level):
 
 
 def cycle_status(level, joining_count, started_at, latest_joining_at, now):
-    if joining_count <= 0 and level < 3:
+    # Below level 2, the first period is 15 days. Level 2 and above always use 7 days.
+    if joining_count <= 0 and level < 2:
         days = 15
         start = started_at
         kind = "initial"
