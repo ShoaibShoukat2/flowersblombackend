@@ -110,6 +110,12 @@ def earning_total(qs):
     return money(qs.aggregate(total=Sum("amount"))["total"] or 0)
 
 
+def approved_withdrawals_today(user):
+    today = timezone.localdate()
+    approved = user.withdrawals.filter(status=Withdrawal.APPROVED)
+    return approved.filter(Q(updated_at__date=today) | Q(updated_at__isnull=True, created_at__date=today))
+
+
 @api_view(["GET"])
 def user_home(request):
     user = request.user
@@ -135,7 +141,11 @@ def user_home(request):
             "withdrawn": earning_total(user.withdrawals.filter(status=Withdrawal.APPROVED)),
             "pending": earning_total(user.withdrawals.filter(status=Withdrawal.PENDING)),
             "rejected": earning_total(user.withdrawals.filter(status=Withdrawal.REJECTED)),
-            "staff": earning_total(txs.filter(remark="referral")),
+            "approved_today": earning_total(approved_withdrawals_today(user)),
+            "staff": earning_total(txs.filter(remark="referral").exclude(level__in=[2, 3])),
+            "indirect": earning_total(txs.filter(remark="referral", level__in=[2, 3])),
+            "indirect_level2": earning_total(txs.filter(remark="referral", level=2)),
+            "indirect_level3": earning_total(txs.filter(remark="referral", level=3)),
             "flowers": earning_total(txs.filter(remark="ads")),
         },
     })
@@ -187,12 +197,15 @@ def transactions(request):
 def team(request):
     rows = []
     for member in request.user.team.select_related("plan").order_by("-id"):
+        if not member.plan_id or member.account_status != "approved":
+            continue
         rows.append({
             "id": member.id,
             "full_name": member.display_name(),
             "email": member.email,
+            "level": member.level,
             "plan": member.plan.name if member.plan else None,
-            "status": "Paid" if member.plan_id else "Unpaid",
+            "status": "Paid",
             "joined": member.date_joined.isoformat(),
         })
     return Response(rows)
@@ -228,17 +241,25 @@ def withdrawals(request):
     if request.method == "POST":
         amount = Decimal(str(request.data.get("amount") or "0"))
         method = (request.data.get("method") or "").strip()
+        account_name = (request.data.get("account_name") or "").strip()
         account = (request.data.get("account") or "").strip()
-        if amount <= 0 or not method or not account:
-            return Response({"detail": "Amount, method, and account are required."}, status=400)
+        if amount <= 0 or not method or not account_name or not account:
+            return Response({"detail": "Amount, method, account name, and account number are required."}, status=400)
         if request.user.balance < amount:
             return Response({"detail": "Not enough balance."}, status=400)
         request.user.balance -= amount
         request.user.save(update_fields=["balance"])
-        Withdrawal.objects.create(user=request.user, amount=amount, method=method, account=account)
+        Withdrawal.objects.create(
+            user=request.user, amount=amount, method=method, account_name=account_name,
+            account=account, updated_at=timezone.now(),
+        )
         Transaction.objects.create(user=request.user, amount=amount, trx_type="-", title="Withdraw", remark="withdraw")
         return Response({"balance": money(request.user.balance)})
-    rows = [{"id": w.id, "amount": money(w.amount), "method": w.method, "account": w.account, "status": w.status, "created_at": w.created_at.isoformat()} for w in request.user.withdrawals.order_by("-id")]
+    rows = [{
+        "id": w.id, "amount": money(w.amount), "method": w.method,
+        "account_name": w.account_name, "account": w.account, "status": w.status,
+        "created_at": w.created_at.isoformat(),
+    } for w in request.user.withdrawals.order_by("-id")]
     return Response(rows)
 
 
@@ -611,7 +632,7 @@ def admin_withdrawals(request):
         qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(account__icontains=q) | Q(method__icontains=q))
     return Response([{
         "id": w.id, "user_id": w.user_id, "full_name": w.user.display_name(), "email": w.user.email,
-        "amount": money(w.amount), "method": w.method, "account": w.account, "status": w.status,
+        "amount": money(w.amount), "method": w.method, "account_name": w.account_name, "account": w.account, "status": w.status,
         "created_at": w.created_at.isoformat(),
     } for w in qs])
 
@@ -626,11 +647,13 @@ def withdrawal_action(request, pk):
     action = request.data.get("action")
     if action == "approve":
         row.status = Withdrawal.APPROVED
+        row.updated_at = timezone.now()
     elif action == "reject":
         if row.status == Withdrawal.PENDING:
             row.user.balance += row.amount
             row.user.save(update_fields=["balance"])
         row.status = Withdrawal.REJECTED
+        row.updated_at = timezone.now()
     row.save()
     return Response({"ok": True})
 

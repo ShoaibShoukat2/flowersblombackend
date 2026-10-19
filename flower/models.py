@@ -23,7 +23,7 @@ class User(AbstractUser):
     role = models.CharField(max_length=10, default="user")
     plan = models.ForeignKey(Plan, null=True, blank=True, on_delete=models.SET_NULL)
     balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
-    referral_code = models.CharField(max_length=20, unique=True)
+    referral_code = models.CharField(max_length=64, unique=True)
     referred_by = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="team")
     account_status = models.CharField(max_length=20, default="approved")
     level = models.PositiveIntegerField(default=0)
@@ -121,9 +121,11 @@ class Withdrawal(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="withdrawals")
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     method = models.CharField(max_length=80)
+    account_name = models.CharField(max_length=120, blank=True, default="")
     account = models.CharField(max_length=80)
     status = models.CharField(max_length=20, default=PENDING)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(null=True, blank=True)
 
 
 class UpgradeRequest(models.Model):
