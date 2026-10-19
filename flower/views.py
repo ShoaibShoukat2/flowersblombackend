@@ -427,15 +427,34 @@ def deposit_create(request):
             return Response({"detail": "This is already your current plan."}, status=400)
         if user.plan and plan.price <= user.plan.price:
             return Response({"detail": "Choose a higher plan to upgrade."}, status=400)
-        if UpgradeRequest.objects.filter(user=user, status=UpgradeRequest.PENDING).exists():
+        waiting = UpgradeRequest.objects.filter(user=user, status=UpgradeRequest.PENDING).order_by("-id").first()
+        if waiting and waiting.screenshot:
             return Response({"detail": "An upgrade request is already waiting for admin approval."}, status=400)
+        if waiting:
+            waiting.from_plan = user.plan
+            waiting.to_plan = plan
+            waiting.amount = plan.price
+            waiting.method = method
+            waiting.sender = sender
+            waiting.screenshot = request.FILES.get("screenshot")
+            waiting.save()
+            return Response({"kind": "upgrade", "status": "pending"})
         UpgradeRequest.objects.create(
             user=user, from_plan=user.plan, to_plan=plan, amount=plan.price,
             method=method, sender=sender, screenshot=request.FILES.get("screenshot"),
         )
         return Response({"kind": "upgrade", "status": "pending"})
-    if user.deposits.filter(status=Deposit.PENDING).exists():
+    pending = user.deposits.filter(status=Deposit.PENDING).order_by("-id").first()
+    if pending and pending.screenshot:
         return Response({"detail": "A plan payment is already waiting for admin approval."}, status=400)
+    if pending:
+        pending.plan = plan
+        pending.amount = plan.price
+        pending.method = method
+        pending.sender = sender
+        pending.screenshot = request.FILES.get("screenshot")
+        pending.save()
+        return Response({"id": pending.id, "kind": "deposit", "status": pending.status})
     deposit = Deposit.objects.create(
         user=user, plan=plan, amount=plan.price, method=method, sender=sender,
         screenshot=request.FILES.get("screenshot"), status=Deposit.PENDING,
