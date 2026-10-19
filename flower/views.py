@@ -22,6 +22,12 @@ def money(value):
     return f"{Decimal(value):.2f}"
 
 
+def media_url(file_field):
+    if not file_field:
+        return None
+    return file_field.url
+
+
 def user_payload(user, request=None):
     return {
         "id": user.id,
@@ -344,7 +350,7 @@ def channels(request):
             "purpose": channel.purpose,
             "description": channel.description,
             "link": channel.link,
-            "image": request.build_absolute_uri(channel.image.url) if channel.image else None,
+            "image": media_url(channel.image),
         })
     return Response(rows)
 
@@ -625,7 +631,7 @@ def admin_user_detail(request, pk):
             "sender": deposit.sender,
             "status": deposit.status,
             "created_at": deposit.created_at.isoformat(),
-            "screenshot": request.build_absolute_uri(deposit.screenshot.url) if deposit.screenshot else None,
+            "screenshot": media_url(deposit.screenshot),
         })
     upgrades = []
     for row in UpgradeRequest.objects.filter(user=user).select_related("from_plan", "to_plan").order_by("-id")[:12]:
@@ -638,7 +644,7 @@ def admin_user_detail(request, pk):
             "sender": row.sender,
             "status": row.status,
             "created_at": row.created_at.isoformat(),
-            "screenshot": request.build_absolute_uri(row.screenshot.url) if row.screenshot else None,
+            "screenshot": media_url(row.screenshot),
         })
     return Response({"user": member_row(user), "team": team, "transactions": txs, "deposits": slips, "upgrades": upgrades})
 
@@ -706,7 +712,7 @@ def admin_deposits(request):
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
         "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "status": d.status, "created_at": d.created_at.isoformat(),
-        "screenshot": request.build_absolute_uri(d.screenshot.url) if d.screenshot else None,
+        "screenshot": media_url(d.screenshot),
     } for d in qs])
 
 
@@ -792,7 +798,7 @@ def admin_upgrades(request):
         "from_plan": r.from_plan.name if r.from_plan else "—", "to_plan": r.to_plan.name if r.to_plan else "—",
         "plan": r.to_plan.name if r.to_plan else "—", "amount": money(r.amount), "method": r.method,
         "sender": r.sender, "status": r.status,
-        "screenshot": request.build_absolute_uri(r.screenshot.url) if r.screenshot else None,
+        "screenshot": media_url(r.screenshot),
     } for r in rows])
 
 
@@ -833,7 +839,7 @@ def admin_channels(request):
         return Response({"id": channel.id})
     rows = []
     for channel in Channel.objects.all():
-        rows.append({"id": channel.id, "title": channel.title, "purpose": channel.purpose, "description": channel.description, "link": channel.link, "status": channel.status, "image": request.build_absolute_uri(channel.image.url) if channel.image else None})
+        rows.append({"id": channel.id, "title": channel.title, "purpose": channel.purpose, "description": channel.description, "link": channel.link, "status": channel.status, "image": media_url(channel.image)})
     return Response(rows)
 
 
