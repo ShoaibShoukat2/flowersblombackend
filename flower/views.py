@@ -265,12 +265,19 @@ def progress_payload(user, count):
     return approved.filter(Q(updated_at__date=today) | Q(updated_at__isnull=True, created_at__date=today))
 
 
+def local_day_bounds():
+    current = timezone.localtime()
+    start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
 @api_view(["GET"])
 def user_home(request):
     user = request.user
     settings = SiteSetting.current()
     count = sync_level(user)
-    done = TaskDone.objects.filter(user=user, created_at__date=timezone.localdate()).count()
+    day_start, day_end = local_day_bounds()
+    done = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
     txs = user.transactions.all()
     progress = progress_payload(user, count)
     return Response({
@@ -337,7 +344,8 @@ def tasks(request):
     count = sync_level(user)
     progress = progress_payload(user, count)
     today = timezone.localdate()
-    done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
+    day_start, day_end = local_day_bounds()
+    done_today = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
     catalog = ensure_task_catalog()
     limit = progress["daily_limit"]
     rate = progress["task_rate"]
@@ -376,11 +384,11 @@ def complete_task(request, pk):
         progress = progress_payload(user, count)
         if progress["locked"]:
             return Response({"detail": progress["message"]}, status=400)
-        today = timezone.localdate()
-        done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
+        day_start, day_end = local_day_bounds()
+        done_today = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
         if done_today >= progress["daily_limit"]:
             return Response({"detail": "Today's task limit is complete."}, status=400)
-        if TaskDone.objects.filter(user=user, task=task, created_at__date=today).exists():
+        if TaskDone.objects.filter(user=user, task=task, created_at__gte=day_start, created_at__lt=day_end).exists():
             return Response({"detail": "This flower is already open today."}, status=400)
         reward = task_rate(user.level)
         TaskDone.objects.create(user=user, task=task)
