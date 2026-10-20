@@ -728,6 +728,55 @@ def admin_analytics(request):
     })
 
 
+def person_brief(user):
+    if not user:
+        return None
+    return {
+        "id": user.id,
+        "full_name": user.display_name(),
+        "email": user.email,
+        "phone": user.phone or "",
+        "username": user.username,
+        "plan": user.plan.name if user.plan_id else None,
+        "level": user.level,
+        "balance": money(user.balance),
+        "status": user.account_status,
+        "paid": bool(user.plan_id),
+    }
+
+
+def team_pack(user):
+    members = []
+    total = active = pending = 0
+    for member in user.team.select_related("plan").order_by("-id"):
+        total += 1
+        if member.plan_id and member.account_status == "approved":
+            active += 1
+        elif member.account_status == "pending":
+            pending += 1
+        if len(members) < 400:
+            members.append({
+                "id": member.id,
+                "full_name": member.display_name(),
+                "email": member.email,
+                "phone": member.phone or "",
+                "plan": member.plan.name if member.plan_id else None,
+                "level": member.level,
+                "status": member.account_status,
+                "paid": bool(member.plan_id),
+                "joined": member.date_joined.isoformat(),
+            })
+    return {
+        "total": total,
+        "active": active,
+        "pending": pending,
+        "level2": User.objects.filter(referred_by__referred_by=user, role="user").count(),
+        "level3": User.objects.filter(referred_by__referred_by__referred_by=user, role="user").count(),
+        "shown": len(members),
+        "members": members,
+    }
+
+
 def member_row(user):
     deposit = user.deposits.order_by("-id").first()
     when = deposit.updated_at if deposit and deposit.status == Deposit.APPROVED else user.date_joined
@@ -775,7 +824,7 @@ def admin_users(request):
 def admin_user_detail(request, pk):
     if not require_admin(request.user):
         return Response(status=403)
-    user = User.objects.select_related("plan").filter(pk=pk, role="user").first()
+    user = User.objects.select_related("plan", "referred_by", "referred_by__plan").filter(pk=pk, role="user").first()
     if not user:
         return Response(status=404)
     team = [member_row(m) for m in user.team.select_related("plan").order_by("-id")]
@@ -805,7 +854,7 @@ def admin_user_detail(request, pk):
             "created_at": row.created_at.isoformat(),
             "screenshot": slip_url("upgrades", row.id, row.screenshot),
         })
-    return Response({"user": member_row(user), "team": team, "transactions": txs, "deposits": slips, "upgrades": upgrades})
+    return Response({"user": member_row(user), "upliner": person_brief(user.referred_by), "team": team, "transactions": txs, "deposits": slips, "upgrades": upgrades})
 
 
 @api_view(["GET"])
@@ -860,7 +909,7 @@ def admin_deposits(request):
     if not require_admin(request.user):
         return Response(status=403)
     status = request.GET.get("status") or "pending"
-    qs = Deposit.objects.select_related("user", "plan").order_by("-id")
+    qs = Deposit.objects.select_related("user", "user__referred_by", "user__referred_by__plan", "plan").order_by("-id")
     if status != "all":
         qs = qs.filter(status=status)
     if request.GET.get("today") == "1":
@@ -873,6 +922,7 @@ def admin_deposits(request):
         "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "status": d.status, "created_at": d.created_at.isoformat(),
         "screenshot": slip_url("deposits", d.id, d.screenshot),
+        "upliner": person_brief(d.user.referred_by),
     } for d in qs])
 
 
@@ -940,13 +990,19 @@ def admin_withdrawals(request):
     } for w in qs])
 
 
-@api_view(["POST"])
+@api_view(["GET", "POST"])
 def withdrawal_action(request, pk):
     if not require_admin(request.user):
         return Response(status=403)
-    row = Withdrawal.objects.select_related("user").filter(pk=pk).first()
+    row = Withdrawal.objects.select_related("user", "user__plan", "user__referred_by", "user__referred_by__plan").filter(pk=pk).first()
     if not row:
         return Response(status=404)
+    if request.method == "GET":
+        return Response({
+            "account": person_brief(row.user),
+            "upliner": person_brief(row.user.referred_by),
+            "team": team_pack(row.user),
+        })
     action = request.data.get("action")
     if action == "approve":
         row.status = Withdrawal.APPROVED
