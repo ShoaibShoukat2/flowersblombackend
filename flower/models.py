@@ -102,6 +102,17 @@ class TaskDone(models.Model):
         indexes = [models.Index(fields=["user", "created_at"], name="flower_taskdone_user_created")]
 
 
+class TaskClaim(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE)
+    day = models.DateField()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "task", "day"], name="flower_one_task_per_day"),
+        ]
+
+
 class Deposit(models.Model):
     PENDING = "pending"
     APPROVED = "approved"

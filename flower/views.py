@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from django.core.cache import cache
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Count, Q, Sum
 from django.http import FileResponse
 from django.utils import timezone
@@ -16,7 +16,7 @@ from rest_framework.response import Response
 from .levels import FLOWER_AMOUNT, LEVEL_JOININGS, cycle_status, level_for_joinings, next_level_target, task_rate
 from .models import (
     Channel, ContactAdmin, Deposit, Gateway, Plan, Reward, SiteSetting,
-    Task, TaskDone, Transaction, UpgradeRequest, User, Withdrawal,
+    Task, TaskClaim, TaskDone, Transaction, UpgradeRequest, User, Withdrawal,
 )
 
 LOGO = "/logo.png"
@@ -338,20 +338,13 @@ def ensure_task_catalog():
     return list(Task.objects.filter(active=True).order_by("id"))
 
 
-@api_view(["GET"])
-def tasks(request):
-    user = request.user
-    count = sync_level(user)
-    progress = progress_payload(user, count)
-    today = timezone.localdate()
-    day_start, day_end = local_day_bounds()
-    done_today = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
+def today_tasks(limit):
     catalog = ensure_task_catalog()
-    limit = progress["daily_limit"]
-    rate = progress["task_rate"]
-    start = today.toordinal() % len(catalog)
+    if not catalog or limit <= 0:
+        return []
+    start = timezone.localdate().toordinal() % len(catalog)
     seen = set()
-    rows = []
+    chosen = []
     for slot in range(limit):
         task = None
         for step in range(len(catalog)):
@@ -362,13 +355,30 @@ def tasks(request):
         if task is None:
             break
         seen.add(task.id)
+        chosen.append(task)
+    return chosen
+
+
+@api_view(["GET"])
+def tasks(request):
+    user = request.user
+    count = sync_level(user)
+    progress = progress_payload(user, count)
+    day_start, day_end = local_day_bounds()
+    done_today = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
+    opened = set(TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).values_list("task_id", flat=True))
+    limit = progress["daily_limit"]
+    rate = progress["task_rate"]
+    limit_full = done_today >= limit
+    rows = []
+    for slot, task in enumerate(today_tasks(limit)):
         rows.append({
             "id": task.id,
             "slot": slot,
             "title": task.title,
             "detail": task.detail,
             "reward": rate,
-            "done": slot < done_today,
+            "done": limit_full or task.id in opened,
         })
     return Response({"tasks": rows, "done_today": done_today, "progress": progress})
 
@@ -378,23 +388,30 @@ def complete_task(request, pk):
     task = Task.objects.filter(pk=pk, active=True).first()
     if not task:
         return Response({"detail": "Task not found."}, status=404)
-    with transaction.atomic():
-        user = User.objects.select_for_update().get(pk=request.user.pk)
-        count = sync_level(user)
-        progress = progress_payload(user, count)
-        if progress["locked"]:
-            return Response({"detail": progress["message"]}, status=400)
-        day_start, day_end = local_day_bounds()
-        done_today = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
-        if done_today >= progress["daily_limit"]:
-            return Response({"detail": "Today's task limit is complete."}, status=400)
-        if TaskDone.objects.filter(user=user, task=task, created_at__gte=day_start, created_at__lt=day_end).exists():
-            return Response({"detail": "This flower is already open today."}, status=400)
-        reward = task_rate(user.level)
-        TaskDone.objects.create(user=user, task=task)
-        user.balance += reward
-        user.save(update_fields=["balance"])
-        Transaction.objects.create(user=user, amount=reward, trx_type="+", title="Task Earning", remark="ads", plan_name=user.plan.name if user.plan else "")
+    try:
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(pk=request.user.pk)
+            count = sync_level(user)
+            progress = progress_payload(user, count)
+            if progress["locked"]:
+                return Response({"detail": progress["message"]}, status=400)
+            assigned = {item.id for item in today_tasks(progress["daily_limit"])}
+            if task.id not in assigned:
+                return Response({"detail": "This flower is not open today."}, status=400)
+            day_start, day_end = local_day_bounds()
+            done_today = TaskDone.objects.filter(user=user, created_at__gte=day_start, created_at__lt=day_end).count()
+            if done_today >= progress["daily_limit"]:
+                return Response({"detail": "Today's task limit is complete."}, status=400)
+            if TaskClaim.objects.filter(user=user, task=task, day=day_start.date()).exists():
+                return Response({"detail": "This flower is already open today."}, status=400)
+            TaskClaim.objects.create(user=user, task=task, day=day_start.date())
+            reward = task_rate(user.level)
+            TaskDone.objects.create(user=user, task=task)
+            user.balance += reward
+            user.save(update_fields=["balance"])
+            Transaction.objects.create(user=user, amount=reward, trx_type="+", title="Task Earning", remark="ads", plan_name=user.plan.name if user.plan else "")
+    except IntegrityError:
+        return Response({"detail": "This flower is already open today."}, status=400)
     return Response({"balance": money(user.balance), "reward": money(reward)})
 
 
