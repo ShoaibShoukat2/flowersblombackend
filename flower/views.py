@@ -534,7 +534,7 @@ def plans(request):
         "current_plan_id": user.plan_id,
         "current_plan": user.plan.name if user.plan else None,
         "plans": [{"id": p.id, "name": p.name, "price": money(p.price), "daily_tasks": p.daily_tasks, "color": p.color, "text_color": p.text_color} for p in Plan.objects.all()],
-        "gateways": [{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number} for g in Gateway.objects.filter(active=True)],
+        "gateways": [{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number} for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()],
         "pending_deposit": None if not pending else {"id": pending.id, "plan_id": pending.plan_id, "plan": pending.plan.name if pending.plan else "", "amount": money(pending.amount), "method": pending.method, "sender": pending.sender, "status": pending.status, "has_screenshot": bool(pending.screenshot)},
         "pending_upgrade": None if not upgrade else {"id": upgrade.id, "plan_id": upgrade.to_plan_id, "plan": upgrade.to_plan.name if upgrade.to_plan else "", "amount": money(upgrade.amount), "method": upgrade.method, "sender": upgrade.sender, "status": upgrade.status, "has_screenshot": bool(upgrade.screenshot)},
     })
