@@ -304,6 +304,33 @@ def user_home(request):
     })
 
 
+TASK_CATALOG = [
+    ("Rose", "Open the rose and collect this flower's earning."),
+    ("Jasmine", "Open the jasmine and collect this flower's earning."),
+    ("Tulip", "Open the tulip and collect this flower's earning."),
+    ("Lily", "Open the lily and collect this flower's earning."),
+    ("Sunflower", "Open the sunflower and collect this flower's earning."),
+    ("Orchid", "Open the orchid and collect this flower's earning."),
+    ("Daisy", "Open the daisy and collect this flower's earning."),
+    ("Marigold", "Open the marigold and collect this flower's earning."),
+    ("Lotus", "Open the lotus and collect this flower's earning."),
+    ("Lavender", "Open the lavender and collect this flower's earning."),
+    ("Peony", "Open the peony and collect this flower's earning."),
+    ("Iris", "Open the iris and collect this flower's earning."),
+]
+
+
+def ensure_task_catalog():
+    for title, detail in TASK_CATALOG:
+        task, created = Task.objects.get_or_create(title=title, defaults={"detail": detail, "reward": 0, "active": True})
+        if not created and (task.detail != detail or not task.active):
+            task.detail = detail
+            task.active = True
+            task.save(update_fields=["detail", "active"])
+    Task.objects.filter(title="Daily task").update(active=False)
+    return list(Task.objects.filter(active=True).order_by("id"))
+
+
 @api_view(["GET"])
 def tasks(request):
     user = request.user
@@ -311,14 +338,22 @@ def tasks(request):
     progress = progress_payload(user, count)
     today = timezone.localdate()
     done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
-    catalog = list(Task.objects.filter(active=True))
-    if not catalog:
-        catalog = [Task.objects.create(title="Daily task", detail="Complete today's assigned task.", reward=0, active=True)]
+    catalog = ensure_task_catalog()
     limit = progress["daily_limit"]
     rate = progress["task_rate"]
+    start = today.toordinal() % len(catalog)
+    seen = set()
     rows = []
     for slot in range(limit):
-        task = catalog[slot % len(catalog)]
+        task = None
+        for step in range(len(catalog)):
+            candidate = catalog[(start + slot + step) % len(catalog)]
+            if candidate.id not in seen:
+                task = candidate
+                break
+        if task is None:
+            break
+        seen.add(task.id)
         rows.append({
             "id": task.id,
             "slot": slot,
@@ -345,6 +380,8 @@ def complete_task(request, pk):
         done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
         if done_today >= progress["daily_limit"]:
             return Response({"detail": "Today's task limit is complete."}, status=400)
+        if TaskDone.objects.filter(user=user, task=task, created_at__date=today).exists():
+            return Response({"detail": "This flower is already open today."}, status=400)
         reward = task_rate(user.level)
         TaskDone.objects.create(user=user, task=task)
         user.balance += reward
