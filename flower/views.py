@@ -45,10 +45,13 @@ def client_ip(request):
 
 def too_many(bucket, limit, seconds):
     key = f"guard:{bucket}"
-    count = cache.get(key, 0)
-    if count >= limit:
-        return True
-    cache.set(key, count + 1, seconds)
+    try:
+        count = cache.get(key, 0) or 0
+        if count >= limit:
+            return True
+        cache.set(key, count + 1, seconds)
+    except Exception:
+        return False
     return False
 
 
