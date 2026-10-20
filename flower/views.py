@@ -296,6 +296,10 @@ def user_home(request):
             "ads": earning_total(txs.filter(remark="ads")),
             "withdrawn": earning_total(txs.filter(remark="withdraw")),
         },
+        "deposits_total": earning_total(user.deposits.filter(status=Deposit.APPROVED)),
+        "withdrawals_total": earning_total(user.withdrawals.filter(status=Withdrawal.APPROVED)),
+        "transaction_count": user.transactions.count(),
+        "upliner_name": user.referred_by.display_name() if user.referred_by_id else "",
         "wallet": {
             "withdrawn": earning_total(user.withdrawals.filter(status=Withdrawal.APPROVED)),
             "pending": earning_total(user.withdrawals.filter(status=Withdrawal.PENDING)),
@@ -854,7 +858,26 @@ def admin_user_detail(request, pk):
             "created_at": row.created_at.isoformat(),
             "screenshot": slip_url("upgrades", row.id, row.screenshot),
         })
-    return Response({"user": member_row(user), "upliner": person_brief(user.referred_by), "team": team, "transactions": txs, "deposits": slips, "upgrades": upgrades})
+    return Response({
+        "user": member_row(user),
+        "profile": {
+            "balance": money(user.balance),
+            "deposits": money(_sum(user.deposits.filter(status=Deposit.APPROVED))),
+            "withdrawals": money(_sum(user.withdrawals.filter(status=Withdrawal.APPROVED))),
+            "transactions": user.transactions.count(),
+            "team": len(team),
+            "level": user.level,
+            "phone": user.phone or "",
+            "email": user.email,
+            "full_name": user.display_name(),
+            "referral_code": user.referral_code,
+        },
+        "upliner": person_brief(user.referred_by),
+        "team": team,
+        "transactions": txs,
+        "deposits": slips,
+        "upgrades": upgrades,
+    })
 
 
 @api_view(["GET"])
@@ -919,6 +942,7 @@ def admin_deposits(request):
         qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(sender__icontains=q) | Q(method__icontains=q))
     return Response([{
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
+        "username": d.user.username, "phone": d.user.phone or "",
         "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "status": d.status, "created_at": d.created_at.isoformat(),
         "screenshot": slip_url("deposits", d.id, d.screenshot),
@@ -985,6 +1009,7 @@ def admin_withdrawals(request):
         qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(account__icontains=q) | Q(method__icontains=q))
     return Response([{
         "id": w.id, "user_id": w.user_id, "full_name": w.user.display_name(), "email": w.user.email,
+        "username": w.user.username, "phone": w.user.phone or "",
         "amount": money(w.amount), "method": w.method, "account_name": w.account_name, "account": w.account, "status": w.status,
         "created_at": w.created_at.isoformat(),
     } for w in qs])
