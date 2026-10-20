@@ -845,6 +845,17 @@ def admin_user_detail(request, pk):
             "created_at": deposit.created_at.isoformat(),
             "screenshot": slip_url("deposits", deposit.id, deposit.screenshot),
         })
+    withdrawals = []
+    for item in user.withdrawals.order_by("-id")[:12]:
+        withdrawals.append({
+            "id": item.id,
+            "amount": money(item.amount),
+            "method": item.method,
+            "account_name": item.account_name,
+            "account": item.account,
+            "status": item.status,
+            "created_at": item.created_at.isoformat(),
+        })
     upgrades = []
     for row in UpgradeRequest.objects.filter(user=user).select_related("from_plan", "to_plan").order_by("-id")[:12]:
         upgrades.append({
@@ -871,11 +882,14 @@ def admin_user_detail(request, pk):
             "email": user.email,
             "full_name": user.display_name(),
             "referral_code": user.referral_code,
+            "flower_balance": money(user.flower_balance),
+            "status": user.account_status,
         },
         "upliner": person_brief(user.referred_by),
         "team": team,
         "transactions": txs,
         "deposits": slips,
+        "withdrawals": withdrawals,
         "upgrades": upgrades,
     })
 
