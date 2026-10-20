@@ -1,7 +1,11 @@
 from datetime import timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from uuid import uuid4
 
+from django.core.cache import cache
+from django.db import transaction
 from django.db.models import Count, Q, Sum
+from django.http import FileResponse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes, parser_classes
@@ -26,6 +30,60 @@ def media_url(file_field):
     if not file_field:
         return None
     return file_field.url
+
+
+def slip_url(kind, pk, file_field):
+    if not file_field:
+        return None
+    return f"/api/admin/{kind}/{pk}/slip"
+
+
+def client_ip(request):
+    forwarded = (request.META.get("HTTP_X_FORWARDED_FOR") or "").split(",")[0].strip()
+    return forwarded or request.META.get("REMOTE_ADDR") or "unknown"
+
+
+def too_many(bucket, limit, seconds):
+    key = f"guard:{bucket}"
+    count = cache.get(key, 0)
+    if count >= limit:
+        return True
+    cache.set(key, count + 1, seconds)
+    return False
+
+
+def image_upload(upload):
+    if not upload:
+        return None
+    if upload.size > 8 * 1024 * 1024:
+        return None
+    head = upload.read(32)
+    upload.seek(0)
+    if head.startswith(b"\xff\xd8\xff"):
+        ext = "jpg"
+    elif head.startswith(b"\x89PNG\r\n\x1a\n"):
+        ext = "png"
+    elif head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        ext = "webp"
+    else:
+        return None
+    upload.name = f"{uuid4().hex}.{ext}"
+    return upload
+
+
+def send_slip(file_field):
+    name = (file_field.name or "").lower()
+    if name.endswith(".png"):
+        content = "image/png"
+    elif name.endswith(".webp"):
+        content = "image/webp"
+    else:
+        content = "image/jpeg"
+    try:
+        handle = file_field.open("rb")
+    except OSError:
+        return Response(status=404)
+    return FileResponse(handle, content_type=content)
 
 
 def user_payload(user, request=None):
@@ -69,19 +127,24 @@ def tx_public(tx, include_email=False):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login(request):
+    if too_many(f"login:{client_ip(request)}", 10, 600):
+        return Response({"detail": "Too many sign-in attempts. Wait a few minutes and try again."}, status=429)
     ident = (request.data.get("identity") or "").strip()
     password = request.data.get("password") or ""
     role = request.data.get("role") or "user"
     user = User.objects.filter(email__iexact=ident).first() or User.objects.filter(username__iexact=ident).first() or User.objects.filter(phone=ident).first()
     if not user or not user.check_password(password) or user.role != role:
         return Response({"detail": "Email, username, or password is incorrect."}, status=400)
-    token, _ = Token.objects.get_or_create(user=user)
+    Token.objects.filter(user=user).delete()
+    token = Token.objects.create(user=user)
     return Response({"token": token.key, "user": user_payload(user)})
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def register(request):
+    if too_many(f"register:{client_ip(request)}", 5, 3600):
+        return Response({"detail": "Too many new accounts from this connection. Try again later."}, status=429)
     full_name = (request.data.get("full_name") or "").strip()
     email = (request.data.get("email") or "").strip().lower()
     phone = (request.data.get("phone") or "").strip()
@@ -266,23 +329,24 @@ def tasks(request):
 
 @api_view(["POST"])
 def complete_task(request, pk):
-    user = request.user
-    count = sync_level(user)
-    progress = progress_payload(user, count)
-    if progress["locked"]:
-        return Response({"detail": progress["message"]}, status=400)
     task = Task.objects.filter(pk=pk, active=True).first()
     if not task:
         return Response({"detail": "Task not found."}, status=404)
-    today = timezone.localdate()
-    done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
-    if done_today >= progress["daily_limit"]:
-        return Response({"detail": "Today's task limit is complete."}, status=400)
-    reward = task_rate(user.level)
-    TaskDone.objects.create(user=user, task=task)
-    user.balance += reward
-    user.save(update_fields=["balance"])
-    Transaction.objects.create(user=user, amount=reward, trx_type="+", title="Task Earning", remark="ads", plan_name=user.plan.name if user.plan else "")
+    with transaction.atomic():
+        user = User.objects.select_for_update().get(pk=request.user.pk)
+        count = sync_level(user)
+        progress = progress_payload(user, count)
+        if progress["locked"]:
+            return Response({"detail": progress["message"]}, status=400)
+        today = timezone.localdate()
+        done_today = TaskDone.objects.filter(user=user, created_at__date=today).count()
+        if done_today >= progress["daily_limit"]:
+            return Response({"detail": "Today's task limit is complete."}, status=400)
+        reward = task_rate(user.level)
+        TaskDone.objects.create(user=user, task=task)
+        user.balance += reward
+        user.save(update_fields=["balance"])
+        Transaction.objects.create(user=user, amount=reward, trx_type="+", title="Task Earning", remark="ads", plan_name=user.plan.name if user.plan else "")
     return Response({"balance": money(user.balance), "reward": money(reward)})
 
 
@@ -358,26 +422,31 @@ def channels(request):
 @api_view(["GET", "POST"])
 def withdrawals(request):
     if request.method == "POST":
-        amount = Decimal(str(request.data.get("amount") or "0"))
+        try:
+            amount = Decimal(str(request.data.get("amount") or "0"))
+        except (InvalidOperation, ValueError):
+            return Response({"detail": "Enter a valid amount."}, status=400)
         method = (request.data.get("method") or "").strip()
         account_name = (request.data.get("account_name") or "").strip()
         account = (request.data.get("account") or "").strip()
         if amount <= 0 or not method or not account_name or not account:
             return Response({"detail": "Amount, method, account name, and account number are required."}, status=400)
-        sync_level(request.user)
-        flower_available = request.user.flower_balance if request.user.level >= 8 else Decimal("0")
-        if request.user.balance + flower_available < amount:
-            return Response({"detail": "Not enough balance."}, status=400)
-        flower_part = amount - request.user.balance if amount > request.user.balance else Decimal("0")
-        request.user.balance -= amount - flower_part
-        request.user.flower_balance -= flower_part
-        request.user.save(update_fields=["balance", "flower_balance"])
-        Withdrawal.objects.create(
-            user=request.user, amount=amount, method=method, account_name=account_name,
-            account=account, flower_part=flower_part, updated_at=timezone.now(),
-        )
-        Transaction.objects.create(user=request.user, amount=amount, trx_type="-", title="Withdraw", remark="withdraw")
-        return Response({"balance": money(request.user.balance)})
+        with transaction.atomic():
+            user = User.objects.select_for_update().get(pk=request.user.pk)
+            sync_level(user)
+            flower_available = user.flower_balance if user.level >= 8 else Decimal("0")
+            if user.balance + flower_available < amount:
+                return Response({"detail": "Not enough balance."}, status=400)
+            flower_part = amount - user.balance if amount > user.balance else Decimal("0")
+            user.balance -= amount - flower_part
+            user.flower_balance -= flower_part
+            user.save(update_fields=["balance", "flower_balance"])
+            Withdrawal.objects.create(
+                user=user, amount=amount, method=method, account_name=account_name,
+                account=account, flower_part=flower_part, updated_at=timezone.now(),
+            )
+            Transaction.objects.create(user=user, amount=amount, trx_type="-", title="Withdraw", remark="withdraw")
+        return Response({"balance": money(user.balance)})
     rows = [{
         "id": w.id, "amount": money(w.amount), "method": w.method,
         "account_name": w.account_name, "account": w.account, "status": w.status,
@@ -420,8 +489,9 @@ def deposit_create(request):
     method = (request.data.get("method") or "").strip()
     if not sender or not method:
         return Response({"detail": "Choose JazzCash or Easypaisa and enter the sender number."}, status=400)
-    if not request.FILES.get("screenshot"):
-        return Response({"detail": "Payment screenshot is required."}, status=400)
+    shot = image_upload(request.FILES.get("screenshot"))
+    if not shot:
+        return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
     if user.plan_id:
         if plan.id == user.plan_id:
             return Response({"detail": "This is already your current plan."}, status=400)
@@ -436,12 +506,12 @@ def deposit_create(request):
             waiting.amount = plan.price
             waiting.method = method
             waiting.sender = sender
-            waiting.screenshot = request.FILES.get("screenshot")
+            waiting.screenshot = shot
             waiting.save()
             return Response({"kind": "upgrade", "status": "pending"})
         UpgradeRequest.objects.create(
             user=user, from_plan=user.plan, to_plan=plan, amount=plan.price,
-            method=method, sender=sender, screenshot=request.FILES.get("screenshot"),
+            method=method, sender=sender, screenshot=shot,
         )
         return Response({"kind": "upgrade", "status": "pending"})
     pending = user.deposits.filter(status=Deposit.PENDING).order_by("-id").first()
@@ -452,12 +522,12 @@ def deposit_create(request):
         pending.amount = plan.price
         pending.method = method
         pending.sender = sender
-        pending.screenshot = request.FILES.get("screenshot")
+        pending.screenshot = shot
         pending.save()
         return Response({"id": pending.id, "kind": "deposit", "status": pending.status})
     deposit = Deposit.objects.create(
         user=user, plan=plan, amount=plan.price, method=method, sender=sender,
-        screenshot=request.FILES.get("screenshot"), status=Deposit.PENDING,
+        screenshot=shot, status=Deposit.PENDING,
     )
     if user.account_status != "approved":
         user.account_status = "pending"
@@ -474,13 +544,14 @@ def upgrade_create(request):
     plan = Plan.objects.filter(pk=plan_id).first()
     if not plan:
         return Response({"detail": "Choose a plan."}, status=400)
-    if not request.FILES.get("screenshot"):
-        return Response({"detail": "Payment screenshot is required."}, status=400)
+    shot = image_upload(request.FILES.get("screenshot"))
+    if not shot:
+        return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
     UpgradeRequest.objects.create(
         user=request.user, from_plan=request.user.plan, to_plan=plan, amount=plan.price,
         method=(request.data.get("method") or "").strip(),
         sender=(request.data.get("sender") or "").strip(),
-        screenshot=request.FILES.get("screenshot"),
+        screenshot=shot,
     )
     return Response({"ok": True})
 
@@ -654,7 +725,7 @@ def admin_user_detail(request, pk):
             "sender": deposit.sender,
             "status": deposit.status,
             "created_at": deposit.created_at.isoformat(),
-            "screenshot": media_url(deposit.screenshot),
+            "screenshot": slip_url("deposits", deposit.id, deposit.screenshot),
         })
     upgrades = []
     for row in UpgradeRequest.objects.filter(user=user).select_related("from_plan", "to_plan").order_by("-id")[:12]:
@@ -667,7 +738,7 @@ def admin_user_detail(request, pk):
             "sender": row.sender,
             "status": row.status,
             "created_at": row.created_at.isoformat(),
-            "screenshot": media_url(row.screenshot),
+            "screenshot": slip_url("upgrades", row.id, row.screenshot),
         })
     return Response({"user": member_row(user), "team": team, "transactions": txs, "deposits": slips, "upgrades": upgrades})
 
@@ -736,8 +807,28 @@ def admin_deposits(request):
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
         "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "status": d.status, "created_at": d.created_at.isoformat(),
-        "screenshot": media_url(d.screenshot),
+        "screenshot": slip_url("deposits", d.id, d.screenshot),
     } for d in qs])
+
+
+@api_view(["GET"])
+def deposit_slip(request, pk):
+    if not require_admin(request.user):
+        return Response(status=403)
+    row = Deposit.objects.filter(pk=pk).first()
+    if not row or not row.screenshot:
+        return Response(status=404)
+    return send_slip(row.screenshot)
+
+
+@api_view(["GET"])
+def upgrade_slip(request, pk):
+    if not require_admin(request.user):
+        return Response(status=403)
+    row = UpgradeRequest.objects.filter(pk=pk).first()
+    if not row or not row.screenshot:
+        return Response(status=404)
+    return send_slip(row.screenshot)
 
 
 @api_view(["POST"])
@@ -822,7 +913,7 @@ def admin_upgrades(request):
         "from_plan": r.from_plan.name if r.from_plan else "—", "to_plan": r.to_plan.name if r.to_plan else "—",
         "plan": r.to_plan.name if r.to_plan else "—", "amount": money(r.amount), "method": r.method,
         "sender": r.sender, "status": r.status,
-        "screenshot": media_url(r.screenshot),
+        "screenshot": slip_url("upgrades", r.id, r.screenshot),
     } for r in rows])
 
 
@@ -852,13 +943,21 @@ def admin_channels(request):
     if not require_admin(request.user):
         return Response(status=403)
     if request.method == "POST":
+        picture = request.FILES.get("image")
+        if picture:
+            picture = image_upload(picture)
+            if not picture:
+                return Response({"detail": "Channel image must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+        link = (request.data.get("link") or "https://flowersblom.com").strip()
+        if not link.startswith("https://") and not link.startswith("http://"):
+            link = "https://flowersblom.com"
         channel = Channel.objects.create(
             title=request.data.get("title") or "Channel",
             purpose=request.data.get("purpose") or "",
             description=request.data.get("description") or "",
-            link=request.data.get("link") or "https://flowersblom.com",
+            link=link,
             status=str(request.data.get("status", "1")) in ("1", "true", "True"),
-            image=request.FILES.get("image"),
+            image=picture,
         )
         return Response({"id": channel.id})
     rows = []
