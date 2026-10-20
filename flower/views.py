@@ -1094,10 +1094,32 @@ def admin_contacts(request):
     return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note} for c in ContactAdmin.objects.all()])
 
 
-@api_view(["GET"])
+@api_view(["GET", "POST"])
 def admin_gateways(request):
     if not require_admin(request.user):
         return Response(status=403)
+    if request.method == "POST":
+        name = (request.data.get("name") or "").strip()
+        account_name = (request.data.get("account_name") or "").strip()
+        account_number = (request.data.get("account_number") or "").strip()
+        if name not in ("JazzCash", "Easypaisa"):
+            return Response({"detail": "Choose JazzCash or Easypaisa."}, status=400)
+        if not account_number:
+            return Response({"detail": "Enter the account number."}, status=400)
+        gateway = None
+        pk = request.data.get("id")
+        if str(pk or "").isdigit():
+            gateway = Gateway.objects.filter(pk=pk).first()
+        if not gateway:
+            key = name.lower()
+            gateway = next((item for item in Gateway.objects.all() if item.name.lower().replace(" ", "") == key), None)
+        if not gateway:
+            gateway = Gateway(name=name)
+        gateway.name = name
+        gateway.account_name = account_name
+        gateway.account_number = account_number
+        gateway.active = True
+        gateway.save()
     return Response([{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number, "active": g.active} for g in Gateway.objects.all()])
 
 
