@@ -138,8 +138,7 @@ def login(request):
     user = User.objects.filter(email__iexact=ident).first() or User.objects.filter(username__iexact=ident).first() or User.objects.filter(phone=ident).first()
     if not user or not user.check_password(password) or user.role != role:
         return Response({"detail": "Email, username, or password is incorrect."}, status=400)
-    Token.objects.filter(user=user).delete()
-    token = Token.objects.create(user=user)
+    token, _ = Token.objects.get_or_create(user=user)
     return Response({"token": token.key, "user": user_payload(user)})
 
 
@@ -259,10 +258,8 @@ def progress_payload(user, count):
         "remaining_seconds": 0 if locked or not user.plan_id else clock["remaining"],
         "flower_balance": money(user.flower_balance),
         "flower_locked": user.level < 8,
+        "remaining_joinings": None if required is None else max(0, required - count),
     }
-    today = timezone.localdate()
-    approved = user.withdrawals.filter(status=Withdrawal.APPROVED)
-    return approved.filter(Q(updated_at__date=today) | Q(updated_at__isnull=True, created_at__date=today))
 
 
 def local_day_bounds():
@@ -470,7 +467,16 @@ def rewards(request):
             "prize": f"Rs {task_rate(step)} per task",
             "reached": count >= required,
         })
-    return Response({"active_team": count, "level": user.level, "task_rate": money(task_rate(user.level)), "items": items})
+    next_level, required = next_level_target(user.level)
+    return Response({
+        "active_team": count,
+        "level": user.level,
+        "task_rate": money(task_rate(user.level)),
+        "next_level": next_level,
+        "next_required": required,
+        "remaining_joinings": None if required is None else max(0, required - count),
+        "items": items,
+    })
 
 
 @api_view(["GET"])
@@ -488,6 +494,21 @@ def channels(request):
     return Response(rows)
 
 
+def mask_account(value):
+    raw = "".join(ch for ch in (value or "") if ch.isalnum())
+    if len(raw) <= 4:
+        return "••••"
+    return f"••••{raw[-4:]}"
+
+
+def withdrawal_rule(user):
+    approved = user.withdrawals.filter(status=Withdrawal.APPROVED).exists()
+    minimum = Decimal("500.00") if approved else Decimal("50.00")
+    message = "After your first approved withdrawal, the minimum is Rs 500." if approved else "Your first withdrawal must be at least Rs 50."
+    flower_available = user.flower_balance if user.level >= 8 else Decimal("0")
+    return minimum, message, user.balance + flower_available
+
+
 @api_view(["GET", "POST"])
 def withdrawals(request):
     if request.method == "POST":
@@ -499,29 +520,39 @@ def withdrawals(request):
         account_name = (request.data.get("account_name") or "").strip()
         account = (request.data.get("account") or "").strip()
         if amount <= 0 or not method or not account_name or not account:
-            return Response({"detail": "Amount, method, account name, and account number are required."}, status=400)
+            return Response({"detail": "Enter an amount above zero, plus the method, account name, and account number."}, status=400)
+        amount = amount.quantize(Decimal("0.01"))
         with transaction.atomic():
             user = User.objects.select_for_update().get(pk=request.user.pk)
             sync_level(user)
-            flower_available = user.flower_balance if user.level >= 8 else Decimal("0")
-            if user.balance + flower_available < amount:
-                return Response({"detail": "Not enough balance."}, status=400)
+            minimum, message, withdrawable = withdrawal_rule(user)
+            if amount < minimum:
+                return Response({"detail": message}, status=400)
+            if amount > withdrawable:
+                return Response({"detail": "That amount is higher than the balance you can withdraw."}, status=400)
             flower_part = amount - user.balance if amount > user.balance else Decimal("0")
             user.balance -= amount - flower_part
             user.flower_balance -= flower_part
             user.save(update_fields=["balance", "flower_balance"])
             Withdrawal.objects.create(
                 user=user, amount=amount, method=method, account_name=account_name,
-                account=account, flower_part=flower_part, updated_at=timezone.now(),
+                account=account, flower_part=flower_part,
             )
-            Transaction.objects.create(user=user, amount=amount, trx_type="-", title="Withdraw", remark="withdraw")
         return Response({"balance": money(user.balance)})
-    rows = [{
-        "id": w.id, "amount": money(w.amount), "method": w.method,
-        "account_name": w.account_name, "account": w.account, "status": w.status,
-        "created_at": w.created_at.isoformat(),
-    } for w in request.user.withdrawals.order_by("-id")]
-    return Response(rows)
+    sync_level(request.user)
+    minimum, message, withdrawable = withdrawal_rule(request.user)
+    rows = []
+    for item in request.user.withdrawals.order_by("-id"):
+        rows.append({
+            "id": item.id,
+            "amount": money(item.amount),
+            "method": item.method,
+            "account_mask": mask_account(item.account),
+            "status": item.status,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+            "approved_at": item.updated_at.isoformat() if item.status == Withdrawal.APPROVED and item.updated_at else None,
+        })
+    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable)})
 
 
 @api_view(["GET"])
@@ -1043,17 +1074,22 @@ def withdrawal_action(request, pk):
             "team": team_pack(row.user),
         })
     action = request.data.get("action")
-    if action == "approve":
-        row.status = Withdrawal.APPROVED
-        row.updated_at = timezone.now()
-    elif action == "reject":
-        if row.status == Withdrawal.PENDING:
-            row.user.balance += row.amount - row.flower_part
-            row.user.flower_balance += row.flower_part
-            row.user.save(update_fields=["balance", "flower_balance"])
-        row.status = Withdrawal.REJECTED
-        row.updated_at = timezone.now()
-    row.save()
+    with transaction.atomic():
+        locked = Withdrawal.objects.select_for_update().select_related("user").filter(pk=row.pk).first()
+        if not locked or locked.status != Withdrawal.PENDING:
+            return Response({"detail": "This withdrawal is already processed."}, status=400)
+        owner = User.objects.select_for_update().get(pk=locked.user_id)
+        if action == "approve":
+            locked.status = Withdrawal.APPROVED
+        elif action == "reject":
+            owner.balance += locked.amount - locked.flower_part
+            owner.flower_balance += locked.flower_part
+            owner.save(update_fields=["balance", "flower_balance"])
+            locked.status = Withdrawal.REJECTED
+        else:
+            return Response({"detail": "Choose approve or reject."}, status=400)
+        locked.updated_at = timezone.now()
+        locked.save(update_fields=["status", "updated_at"])
     return Response({"ok": True})
 
 
