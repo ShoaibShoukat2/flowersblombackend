@@ -1,5 +1,5 @@
-from datetime import timedelta
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, time, timedelta
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from uuid import uuid4
 
 from django.core.cache import cache
@@ -107,8 +107,26 @@ def user_payload(user, request=None):
     }
 
 
-def require_admin(user):
-    return user.is_authenticated and user.role == "admin"
+def require_admin(request):
+    user = getattr(request, "user", None)
+    if not user or not user.is_authenticated or user.role != "admin":
+        return False
+    key = request.headers.get("X-Admin-Session") or ""
+    if key:
+        from .models import AdminSession
+        row = AdminSession.objects.filter(key=key, user=user, revoked=False).first()
+        if not row:
+            return False
+        row.save(update_fields=["last_seen"])
+    return True
+
+
+def banned_response(user):
+    if not user or not user.is_authenticated:
+        return None
+    if user.account_status == "banned" or user.banned_at:
+        return Response({"detail": "Your Account Is Banned", "reason": user.ban_reason or ""}, status=403)
+    return None
 
 
 def tx_public(tx, include_email=False):
@@ -138,8 +156,14 @@ def login(request):
     user = User.objects.filter(email__iexact=ident).first() or User.objects.filter(username__iexact=ident).first() or User.objects.filter(phone=ident).first()
     if not user or not user.check_password(password) or user.role != role:
         return Response({"detail": "Email, username, or password is incorrect."}, status=400)
+    if user.account_status == "banned" or user.banned_at:
+        return Response({"detail": "Your Account Is Banned", "reason": user.ban_reason or ""}, status=403)
     token, _ = Token.objects.get_or_create(user=user)
-    return Response({"token": token.key, "user": user_payload(user)})
+    payload = {"token": token.key, "user": user_payload(user)}
+    if user.role == "admin":
+        from .desk import open_session
+        payload["session_key"] = open_session(request, user)
+    return Response(payload)
 
 
 @api_view(["POST"])
@@ -171,6 +195,9 @@ def register(request):
 
 @api_view(["GET"])
 def me(request):
+    blocked = banned_response(request.user)
+    if blocked:
+        return blocked
     settings = SiteSetting.current()
     data = user_payload(request.user)
     data["notice"] = settings.notice
@@ -268,8 +295,58 @@ def local_day_bounds():
     return start, start + timedelta(days=1)
 
 
+def day_window(day=None):
+    if day is None:
+        return local_day_bounds()
+    start = timezone.make_aware(datetime.combine(day, time.min), timezone.get_current_timezone())
+    return start, start + timedelta(days=1)
+
+
+def parse_day(raw):
+    text = (raw or "").strip()
+    if not text or text == "today":
+        return timezone.localdate()
+    try:
+        return datetime.fromisoformat(text[:10]).date()
+    except ValueError:
+        return timezone.localdate()
+
+
+def between(qs, field, day=None):
+    start, end = day_window(day)
+    return qs.filter(**{f"{field}__gte": start, f"{field}__lt": end})
+
+
+def approved_deposits_on(day=None):
+    """Joining plans approved on this local day, including older pending or rejected slips."""
+    start, end = day_window(day)
+    return Deposit.objects.filter(status=Deposit.APPROVED).filter(
+        Q(approved_at__gte=start, approved_at__lt=end)
+        | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
+    )
+
+
+def approved_withdrawals_on(day=None):
+    start, end = day_window(day)
+    return Withdrawal.objects.filter(status=Withdrawal.APPROVED).filter(
+        Q(updated_at__gte=start, updated_at__lt=end)
+        | Q(updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+    )
+
+
+def growth_percent(current, previous):
+    current = Decimal(current or 0)
+    previous = Decimal(previous or 0)
+    if previous == 0:
+        return 0
+    return int(((current - previous) / previous * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
 @api_view(["GET"])
 def user_home(request):
+    blocked = banned_response(request.user)
+    if blocked:
+        return blocked
     user = request.user
     settings = SiteSetting.current()
     count = sync_level(user)
@@ -386,6 +463,9 @@ def tasks(request):
 
 @api_view(["POST"])
 def complete_task(request, pk):
+    blocked = banned_response(request.user)
+    if blocked:
+        return blocked
     task = Task.objects.filter(pk=pk, active=True).first()
     if not task:
         return Response({"detail": "Task not found."}, status=404)
@@ -511,6 +591,9 @@ def withdrawal_rule(user):
 
 @api_view(["GET", "POST"])
 def withdrawals(request):
+    blocked = banned_response(request.user)
+    if blocked:
+        return blocked
     if request.method == "POST":
         try:
             amount = Decimal(str(request.data.get("amount") or "0"))
@@ -521,6 +604,9 @@ def withdrawals(request):
         account = (request.data.get("account") or "").strip()
         if amount <= 0 or not method or not account_name or not account:
             return Response({"detail": "Enter an amount above zero, plus the method, account name, and account number."}, status=400)
+        active_names = {g.name.lower().replace(" ", "") for g in Gateway.objects.filter(active=True)}
+        if method.lower().replace(" ", "") not in active_names:
+            return Response({"detail": "That payment method is not available."}, status=400)
         amount = amount.quantize(Decimal("0.01"))
         with transaction.atomic():
             user = User.objects.select_for_update().get(pk=request.user.pk)
@@ -552,12 +638,13 @@ def withdrawals(request):
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "approved_at": item.updated_at.isoformat() if item.status == Withdrawal.APPROVED and item.updated_at else None,
         })
-    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable)})
+    methods = [g.name for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()]
+    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable), "methods": methods})
 
 
 @api_view(["GET"])
 def contacts(request):
-    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note} for c in ContactAdmin.objects.all()])
+    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
 
 
 @api_view(["GET"])
@@ -569,7 +656,8 @@ def plans(request):
         "current_plan_id": user.plan_id,
         "current_plan": user.plan.name if user.plan else None,
         "plans": [{"id": p.id, "name": p.name, "price": money(p.price), "daily_tasks": p.daily_tasks, "color": p.color, "text_color": p.text_color} for p in Plan.objects.all()],
-        "gateways": [{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number} for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()],
+        "gateways": [{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number, "image": media_url(g.image)} for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()],
+        "current_price": money(user.plan.price) if user.plan_id else "0.00",
         "pending_deposit": None if not pending else {"id": pending.id, "plan_id": pending.plan_id, "plan": pending.plan.name if pending.plan else "", "amount": money(pending.amount), "method": pending.method, "sender": pending.sender, "status": pending.status, "has_screenshot": bool(pending.screenshot)},
         "pending_upgrade": None if not upgrade else {"id": upgrade.id, "plan_id": upgrade.to_plan_id, "plan": upgrade.to_plan.name if upgrade.to_plan else "", "amount": money(upgrade.amount), "method": upgrade.method, "sender": upgrade.sender, "status": upgrade.status, "has_screenshot": bool(upgrade.screenshot)},
     })
@@ -592,25 +680,31 @@ def deposit_create(request):
     shot = image_upload(request.FILES.get("screenshot"))
     if not shot:
         return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+    chosen_methods = [part.strip() for part in method.split("/") if part.strip()]
+    active_gateways = [g for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()]
+    active_names = {g.name.lower().replace(" ", "") for g in active_gateways}
+    if not chosen_methods or any(part.lower().replace(" ", "") not in active_names for part in chosen_methods):
+        return Response({"detail": "That payment method is not available."}, status=400)
     if user.plan_id:
         if plan.id == user.plan_id:
             return Response({"detail": "This is already your current plan."}, status=400)
         if user.plan and plan.price <= user.plan.price:
             return Response({"detail": "Choose a higher plan to upgrade."}, status=400)
+        extra = (plan.price - user.plan.price).quantize(Decimal("0.01"))
         waiting = UpgradeRequest.objects.filter(user=user, status=UpgradeRequest.PENDING).order_by("-id").first()
         if waiting and waiting.screenshot:
             return Response({"detail": "An upgrade request is already waiting for admin approval."}, status=400)
         if waiting:
             waiting.from_plan = user.plan
             waiting.to_plan = plan
-            waiting.amount = plan.price
+            waiting.amount = extra
             waiting.method = method
             waiting.sender = sender
             waiting.screenshot = shot
             waiting.save()
             return Response({"kind": "upgrade", "status": "pending"})
         UpgradeRequest.objects.create(
-            user=user, from_plan=user.plan, to_plan=plan, amount=plan.price,
+            user=user, from_plan=user.plan, to_plan=plan, amount=extra,
             method=method, sender=sender, screenshot=shot,
         )
         return Response({"kind": "upgrade", "status": "pending"})
@@ -647,8 +741,12 @@ def upgrade_create(request):
     shot = image_upload(request.FILES.get("screenshot"))
     if not shot:
         return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+    current = request.user.plan.price if request.user.plan_id else Decimal("0")
+    extra = (plan.price - current).quantize(Decimal("0.01"))
+    if extra <= 0:
+        return Response({"detail": "Choose a higher plan to upgrade."}, status=400)
     UpgradeRequest.objects.create(
-        user=request.user, from_plan=request.user.plan, to_plan=plan, amount=plan.price,
+        user=request.user, from_plan=request.user.plan, to_plan=plan, amount=extra,
         method=(request.data.get("method") or "").strip(),
         sender=(request.data.get("sender") or "").strip(),
         screenshot=shot,
@@ -678,37 +776,70 @@ def credit_referral(deposit):
     credit_referral_amount(deposit.user, deposit.amount, deposit.plan)
 
 
+def task_earnings():
+    # Completed task credits only. Plan payments, referrals, flower, and restorations stay out.
+    return Transaction.objects.filter(remark="ads", trx_type="+")
+
+
+def manual_additions():
+    return Transaction.objects.filter(remark="balance_add", trx_type="+")
+
+
+def manual_subtractions():
+    return Transaction.objects.filter(remark__in=["balance_sub", "balance_subtract"], trx_type="-")
+
+
+def referral_commissions():
+    return Transaction.objects.filter(remark="referral", trx_type="+")
+
+
 @api_view(["GET"])
 def admin_summary(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response({"detail": "Admin only."}, status=403)
-    today = timezone.localdate()
     approved_deposits = Deposit.objects.filter(status=Deposit.APPROVED)
     approved_withdrawals = Withdrawal.objects.filter(status=Withdrawal.APPROVED)
-    manual_add = Transaction.objects.filter(trx_type="+").exclude(remark__in=["referral", "ads"])
-    manual_sub = Transaction.objects.filter(trx_type="-").exclude(remark="withdraw")
-    task_earn = Transaction.objects.filter(remark="ads")
+    approved_today = approved_deposits_on()
+    paid_today = approved_withdrawals_on()
+    task_earn = task_earnings()
+    manual_add = manual_additions()
+    manual_sub = manual_subtractions()
+    referral = referral_commissions()
+    week_start, _end = day_window()
+    week_start = week_start - timedelta(days=7)
+    users = User.objects.filter(role="user")
+    users_then = users.filter(date_joined__lt=week_start).count()
+    deposited_then = _sum(approved_deposits.filter(
+        Q(approved_at__lt=week_start) | Q(approved_at__isnull=True, updated_at__lt=week_start)
+    ))
+    deposited_now = _sum(approved_deposits)
+    users_now = users.count()
     return Response({
-        "users": User.objects.filter(role="user").count(),
+        "users": users_now,
         "pending_deposits": Deposit.objects.filter(status=Deposit.PENDING).count(),
         "pending_withdrawals": Withdrawal.objects.filter(status=Withdrawal.PENDING).count(),
-        "approved_today": Deposit.objects.filter(status=Deposit.APPROVED, updated_at__date=today).count(),
-        "withdraw_today": approved_withdrawals.filter(created_at__date=today).count(),
+        "approved_today": approved_today.count(),
+        "withdraw_today": paid_today.count(),
         "pending_upgrades": UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING).count(),
         "rejected_users": User.objects.filter(role="user", account_status="rejected").count(),
+        "users_week_percent": growth_percent(users_now, users_then),
+        "deposited_week_percent": growth_percent(deposited_now, deposited_then),
         "money": {
-            "referral": money(_sum(Transaction.objects.filter(remark="referral"))),
-            "deposited": money(_sum(approved_deposits)),
-            "approved_users_today": User.objects.filter(role="user", deposits__status=Deposit.APPROVED, deposits__updated_at__date=today).distinct().count(),
-            "withdrawals_today": money(_sum(approved_withdrawals.filter(created_at__date=today))),
-            "received_today": money(_sum(approved_deposits.filter(updated_at__date=today))),
+            "referral": money(_sum(referral)),
+            "referral_today": money(_sum(between(referral, "created_at"))),
+            "deposited": money(deposited_now),
+            "approved_users_today": approved_today.count(),
+            "withdrawals_today": money(_sum(paid_today)),
+            "withdraw_today_count": paid_today.count(),
+            "received_today": money(_sum(approved_today)),
+            "pending_withdraw_amount": money(_sum(Withdrawal.objects.filter(status=Withdrawal.PENDING))),
             "withdrawn": money(_sum(approved_withdrawals)),
             "task": money(_sum(task_earn)),
-            "task_today": money(_sum(task_earn.filter(created_at__date=today))),
+            "task_today": money(_sum(between(task_earn, "created_at"))),
             "manual_add": money(_sum(manual_add)),
-            "manual_add_today": money(_sum(manual_add.filter(created_at__date=today))),
+            "manual_add_today": money(_sum(between(manual_add, "created_at"))),
             "manual_sub": money(_sum(manual_sub)),
-            "manual_sub_today": money(_sum(manual_sub.filter(created_at__date=today))),
+            "manual_sub_today": money(_sum(between(manual_sub, "created_at"))),
             "balances": money(_sum(User.objects.filter(role="user"), "balance")),
         },
     })
@@ -718,10 +849,36 @@ def _sum(qs, field="amount"):
     return qs.aggregate(total=Sum(field))["total"] or Decimal("0")
 
 
+def _period(qs, start, end, field="created_at"):
+    if start:
+        qs = qs.filter(**{f"{field}__date__gte": start})
+    if end:
+        qs = qs.filter(**{f"{field}__date__lte": end})
+    return qs
+
+
+def analytics_pack(start="", end=""):
+    earnings = Transaction.objects.filter(trx_type="+", remark__in=["ads", "referral", "restore20", "upgrade_referral"])
+    manual = Transaction.objects.filter(remark="balance_add")
+    paid = Withdrawal.objects.filter(status=Withdrawal.APPROVED)
+    tasks = TaskDone.objects.all()
+    users = User.objects.filter(role="user", account_status="approved")
+    return {
+        "earnings": money(_sum(_period(earnings, start, end))),
+        "manual_added": money(_sum(_period(manual, start, end))),
+        "withdrawals": money(_sum(_period(paid, start, end, "updated_at"))),
+        "tasks": _period(tasks, start, end).count(),
+        "approved_users": _period(users, start, end, "activated_at").count() if (start or end) else users.count(),
+        "wallet_balance": money(_sum(User.objects.filter(role="user"), "balance")),
+    }
+
+
 @api_view(["GET"])
 def admin_analytics(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
+    start = request.GET.get("start") or ""
+    end = request.GET.get("end") or ""
     sales = _sum(Deposit.objects.filter(status=Deposit.APPROVED))
     direct = _sum(Transaction.objects.filter(remark="referral", level=1))
     indirect = _sum(Transaction.objects.filter(remark="referral", level__in=[2, 3]))
@@ -752,6 +909,8 @@ def admin_analytics(request):
         "balances": money(balances),
         "profit": money(abs(profit)),
         "result": "profit" if profit >= 0 else "loss",
+        "overall": analytics_pack(),
+        "period": analytics_pack(start, end) if (start or end) else None,
         "days": days,
         "mix": [
             {"label": "Plan sales", "value": float(sales)},
@@ -836,7 +995,7 @@ def member_row(user):
 
 @api_view(["GET"])
 def admin_users(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     status = request.GET.get("status") or "approved"
     qs = User.objects.filter(role="user").select_related("plan")
@@ -857,7 +1016,7 @@ def admin_users(request):
 
 @api_view(["GET"])
 def admin_user_detail(request, pk):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     user = User.objects.select_related("plan", "referred_by", "referred_by__plan").filter(pk=pk, role="user").first()
     if not user:
@@ -915,6 +1074,10 @@ def admin_user_detail(request, pk):
             "referral_code": user.referral_code,
             "flower_balance": money(user.flower_balance),
             "status": user.account_status,
+            "first_name": user.first_name or "",
+            "last_name": user.last_name or "",
+            "ban_reason": user.ban_reason or "",
+            "plan": user.plan.name if user.plan else "",
         },
         "upliner": person_brief(user.referred_by),
         "team": team,
@@ -927,13 +1090,14 @@ def admin_user_detail(request, pk):
 
 @api_view(["GET"])
 def leaderboard(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     users = User.objects.filter(role="user", plan__isnull=False).select_related("plan").annotate(active=Count("team"))
     rows = []
     for user in users:
         row = member_row(user)
-        row["active_team"] = user.team.filter(plan__isnull=False).count()
+        row["active_team"] = approved_joinings(user).count()
+        row["earnings"] = money(user.transactions.filter(remark__in=["ads", "referral", "restore20", "upgrade_referral"]).aggregate(s=Sum("amount"))["s"] or 0)
         rows.append(row)
     rows.sort(key=lambda r: (-r["level"], -r["active_team"], -Decimal(r["earnings"])))
     return Response(rows)
@@ -941,7 +1105,7 @@ def leaderboard(request):
 
 @api_view(["GET"])
 def admin_transactions(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     qs = Transaction.objects.select_related("user").order_by("-id")
     category = request.GET.get("category") or ""
@@ -954,34 +1118,61 @@ def admin_transactions(request):
     elif category == "withdraw":
         qs = qs.filter(remark="withdraw")
     elif category == "ads":
-        qs = qs.filter(remark="ads")
+        qs = task_earnings()
     elif category == "manual_add":
-        qs = qs.filter(trx_type="+").exclude(remark__in=["referral", "ads"])
+        qs = manual_additions()
     elif category == "manual_sub":
-        qs = qs.filter(trx_type="-").exclude(remark="withdraw")
+        qs = manual_subtractions()
+    elif category == "referral":
+        qs = referral_commissions()
     q = (request.GET.get("q") or "").strip()
     if q:
         qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(title__icontains=q) | Q(source_email__icontains=q))
+    raw_date = (request.GET.get("date") or "").strip()
+    chosen = parse_day(raw_date) if raw_date else None
+    if chosen:
+        qs = between(qs, "created_at", chosen)
+    try:
+        page = max(1, int(request.GET.get("page") or 1))
+    except ValueError:
+        page = 1
+    page_size = 80
+    count = qs.count()
+    pages = max(1, (count + page_size - 1) // page_size)
+    page = min(page, pages)
+    start = (page - 1) * page_size
     rows = []
-    for tx in qs[:150]:
+    for tx in qs.select_related("user")[start:start + page_size]:
         item = tx_public(tx, include_email=True)
         item["user_id"] = tx.user_id
         item["user_name"] = tx.user.display_name()
         item["user_email"] = tx.user.email
         rows.append(item)
-    return Response(rows)
+    return Response({
+        "total": money(_sum(qs)),
+        "count": count,
+        "page": page,
+        "pages": pages,
+        "date": chosen.isoformat() if chosen else "",
+        "rows": rows,
+    })
 
 
 @api_view(["GET"])
 def admin_deposits(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     status = request.GET.get("status") or "pending"
     qs = Deposit.objects.select_related("user", "user__referred_by", "user__referred_by__plan", "plan").order_by("-id")
-    if status != "all":
-        qs = qs.filter(status=status)
     if request.GET.get("today") == "1":
-        qs = qs.filter(updated_at__date=timezone.localdate())
+        raw_day = request.GET.get("date") or ""
+        qs = approved_deposits_on(parse_day(raw_day) if raw_day else None).select_related("user", "user__referred_by", "user__referred_by__plan", "plan").order_by("-approved_at", "-id")
+    elif status != "all":
+        qs = qs.filter(status=status)
+    if request.GET.get("date") and request.GET.get("today") != "1":
+        qs = between(qs, "created_at", parse_day(request.GET.get("date")))
+    if request.GET.get("plan"):
+        qs = qs.filter(plan__name__iexact=request.GET.get("plan"))
     q = (request.GET.get("q") or "").strip()
     if q:
         qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(sender__icontains=q) | Q(method__icontains=q))
@@ -990,6 +1181,7 @@ def admin_deposits(request):
         "username": d.user.username, "phone": d.user.phone or "",
         "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "status": d.status, "created_at": d.created_at.isoformat(),
+        "reject_reason": d.reject_reason, "approved_at": d.approved_at.isoformat() if d.approved_at else None,
         "screenshot": slip_url("deposits", d.id, d.screenshot),
         "upliner": person_brief(d.user.referred_by),
     } for d in qs])
@@ -997,7 +1189,7 @@ def admin_deposits(request):
 
 @api_view(["GET"])
 def deposit_slip(request, pk):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     row = Deposit.objects.filter(pk=pk).first()
     if not row or not row.screenshot:
@@ -1007,7 +1199,7 @@ def deposit_slip(request, pk):
 
 @api_view(["GET"])
 def upgrade_slip(request, pk):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     row = UpgradeRequest.objects.filter(pk=pk).first()
     if not row or not row.screenshot:
@@ -1017,52 +1209,72 @@ def upgrade_slip(request, pk):
 
 @api_view(["POST"])
 def deposit_action(request, pk):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
-    deposit = Deposit.objects.select_related("user", "plan").filter(pk=pk).first()
-    if not deposit:
-        return Response(status=404)
     action = request.data.get("action")
-    if action == "approve" and deposit.status != Deposit.APPROVED:
-        deposit.status = Deposit.APPROVED
-        deposit.save()
-        deposit.user.plan = deposit.plan
-        deposit.user.account_status = "approved"
-        deposit.user.save()
-        activate_member(deposit.user)
-        credit_referral(deposit)
-    elif action == "reject":
-        deposit.status = Deposit.REJECTED
-        deposit.save()
-        deposit.user.account_status = "rejected"
-        deposit.user.save(update_fields=["account_status"])
+    reason = (request.data.get("reason") or "").strip()
+    if action == "reject" and not reason:
+        return Response({"detail": "A rejection reason is required."}, status=400)
+    with transaction.atomic():
+        deposit = Deposit.objects.select_for_update().select_related("user", "plan").filter(pk=pk).first()
+        if not deposit:
+            return Response(status=404)
+        if action == "approve":
+            if deposit.status == Deposit.APPROVED:
+                return Response({"detail": "This payment is already approved."}, status=400)
+            deposit.status = Deposit.APPROVED
+            deposit.approved_at = timezone.now()
+            deposit.reject_reason = ""
+            deposit.save(update_fields=["status", "approved_at", "reject_reason", "updated_at"])
+            owner = User.objects.select_for_update().get(pk=deposit.user_id)
+            owner.plan = deposit.plan
+            owner.account_status = "approved"
+            owner.ban_reason = ""
+            owner.banned_at = None
+            owner.save()
+            activate_member(owner)
+            already = Transaction.objects.filter(remark="referral", source_email=owner.email, plan_name=deposit.plan.name if deposit.plan else "").exists()
+            if not already:
+                credit_referral(deposit)
+        elif action == "reject":
+            if deposit.status == Deposit.APPROVED:
+                return Response({"detail": "An approved payment cannot be rejected from here."}, status=400)
+            deposit.status = Deposit.REJECTED
+            deposit.reject_reason = reason
+            deposit.save(update_fields=["status", "reject_reason", "updated_at"])
+            if deposit.user.account_status != "approved":
+                deposit.user.account_status = "rejected"
+                deposit.user.save(update_fields=["account_status"])
+        else:
+            return Response({"detail": "Choose approve or reject."}, status=400)
     return Response({"ok": True})
 
 
 @api_view(["GET"])
 def admin_withdrawals(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     status = request.GET.get("status") or "pending"
     qs = Withdrawal.objects.select_related("user").order_by("-id")
     if status != "all":
         qs = qs.filter(status=status)
-    if request.GET.get("today") == "1":
-        qs = qs.filter(created_at__date=timezone.localdate())
+    if request.GET.get("today") == "1" or request.GET.get("date"):
+        qs = approved_withdrawals_on(parse_day(request.GET.get("date") or "today")).select_related("user").order_by("-updated_at", "-id")
     q = (request.GET.get("q") or "").strip()
     if q:
-        qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(account__icontains=q) | Q(method__icontains=q))
+        qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(user__phone__icontains=q) | Q(account__icontains=q) | Q(method__icontains=q) | Q(user__username__icontains=q))
     return Response([{
         "id": w.id, "user_id": w.user_id, "full_name": w.user.display_name(), "email": w.user.email,
         "username": w.user.username, "phone": w.user.phone or "",
         "amount": money(w.amount), "method": w.method, "account_name": w.account_name, "account": w.account, "status": w.status,
-        "created_at": w.created_at.isoformat(),
+        "admin_remark": w.admin_remark, "created_at": w.created_at.isoformat(),
+        "approved_at": w.updated_at.isoformat() if w.status == Withdrawal.APPROVED and w.updated_at else None,
     } for w in qs])
 
 
 @api_view(["GET", "POST"])
 def withdrawal_action(request, pk):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     row = Withdrawal.objects.select_related("user", "user__plan", "user__referred_by", "user__referred_by__plan").filter(pk=pk).first()
     if not row:
@@ -1074,6 +1286,9 @@ def withdrawal_action(request, pk):
             "team": team_pack(row.user),
         })
     action = request.data.get("action")
+    remark = (request.data.get("reason") or request.data.get("remark") or "").strip()
+    if action == "reject" and not remark:
+        return Response({"detail": "A rejection reason is required."}, status=400)
     with transaction.atomic():
         locked = Withdrawal.objects.select_for_update().select_related("user").filter(pk=row.pk).first()
         if not locked or locked.status != Withdrawal.PENDING:
@@ -1088,14 +1303,15 @@ def withdrawal_action(request, pk):
             locked.status = Withdrawal.REJECTED
         else:
             return Response({"detail": "Choose approve or reject."}, status=400)
+        locked.admin_remark = remark
         locked.updated_at = timezone.now()
-        locked.save(update_fields=["status", "updated_at"])
+        locked.save(update_fields=["status", "updated_at", "admin_remark"])
     return Response({"ok": True})
 
 
 @api_view(["GET"])
 def admin_upgrades(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     status = request.GET.get("status") or "pending"
     rows = UpgradeRequest.objects.select_related("user", "from_plan", "to_plan").order_by("-id")
@@ -1108,35 +1324,72 @@ def admin_upgrades(request):
         "id": r.id, "user_id": r.user_id, "full_name": r.user.display_name(), "email": r.user.email,
         "from_plan": r.from_plan.name if r.from_plan else "—", "to_plan": r.to_plan.name if r.to_plan else "—",
         "plan": r.to_plan.name if r.to_plan else "—", "amount": money(r.amount), "method": r.method,
-        "sender": r.sender, "status": r.status,
+        "sender": r.sender, "status": r.status, "reject_reason": r.reject_reason,
+        "old_paid": money(r.from_plan.price) if r.from_plan else "0.00",
+        "additional": money((r.to_plan.price - r.from_plan.price) if r.from_plan and r.to_plan and r.to_plan.price > r.from_plan.price else r.amount),
+        "username": r.user.username, "phone": r.user.phone or "",
+        "upliner": person_brief(r.user.referred_by),
         "screenshot": slip_url("upgrades", r.id, r.screenshot),
     } for r in rows])
 
 
 @api_view(["POST"])
 def upgrade_action(request, pk):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
-    row = UpgradeRequest.objects.select_related("user", "to_plan").filter(pk=pk).first()
-    if not row:
-        return Response(status=404)
-    if request.data.get("action") == "approve" and row.status != UpgradeRequest.APPROVED:
-        row.status = UpgradeRequest.APPROVED
-        row.user.plan = row.to_plan
-        row.user.account_status = "approved"
-        row.user.save(update_fields=["plan", "account_status", "activated_at", "flower_balance", "flower_credited", "level"])
-        activate_member(row.user)
-        credit_referral_amount(row.user, row.amount, row.to_plan)
-    elif request.data.get("action") == "reject":
-        row.status = UpgradeRequest.REJECTED
-    row.save()
+    action = request.data.get("action")
+    reason = (request.data.get("reason") or "").strip()
+    if action == "reject" and not reason:
+        return Response({"detail": "A rejection reason is required."}, status=400)
+    with transaction.atomic():
+        row = UpgradeRequest.objects.select_for_update().select_related("user", "from_plan", "to_plan").filter(pk=pk).first()
+        if not row:
+            return Response(status=404)
+        if action == "approve":
+            if row.status == UpgradeRequest.APPROVED:
+                return Response({"detail": "This upgrade is already approved."}, status=400)
+            payable = row.amount
+            if row.from_plan_id and row.to_plan_id:
+                difference = (row.to_plan.price - row.from_plan.price).quantize(Decimal("0.01"))
+                if difference > 0:
+                    payable = difference
+            pay = str(request.data.get("pay_commission") or "").lower() in ("1", "true", "yes")
+            row.status = UpgradeRequest.APPROVED
+            row.pay_commission = pay
+            row.approved_at = timezone.now()
+            owner = User.objects.select_for_update().get(pk=row.user_id)
+            owner.plan = row.to_plan
+            owner.account_status = "approved"
+            owner.save(update_fields=["plan", "account_status"])
+            activate_member(owner)
+            if pay and payable > 0 and owner.referred_by_id:
+                percent = SiteSetting.current().upgrade_commission_percent or Decimal("20")
+                commission = (Decimal(payable) * percent / Decimal("100")).quantize(Decimal("0.01"))
+                plan_name = row.to_plan.name if row.to_plan else ""
+                already = Transaction.objects.filter(remark="upgrade_referral", source_email=owner.email, plan_name=plan_name).exists()
+                if not already and commission > 0:
+                    upliner = User.objects.select_for_update().get(pk=owner.referred_by_id)
+                    upliner.balance += commission
+                    upliner.save(update_fields=["balance"])
+                    Transaction.objects.create(
+                        user=upliner, amount=commission, trx_type="+", title="Upgrade Referral Commission",
+                        level=1, plan_name=plan_name, source_email=owner.email, remark="upgrade_referral",
+                    )
+        elif action == "reject":
+            if row.status == UpgradeRequest.APPROVED:
+                return Response({"detail": "An approved upgrade cannot be rejected from here."}, status=400)
+            row.status = UpgradeRequest.REJECTED
+            row.reject_reason = reason
+        else:
+            return Response({"detail": "Choose approve or reject."}, status=400)
+        row.save()
     return Response({"ok": True})
 
 
 @api_view(["GET", "POST"])
 @parser_classes([MultiPartParser, FormParser, JSONParser])
 def admin_channels(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     if request.method == "POST":
         picture = request.FILES.get("image")
@@ -1164,14 +1417,14 @@ def admin_channels(request):
 
 @api_view(["GET"])
 def admin_contacts(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
-    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note} for c in ContactAdmin.objects.all()])
+    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
 
 
 @api_view(["GET", "POST"])
 def admin_gateways(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     if request.method == "POST":
         name = (request.data.get("name") or "").strip()
@@ -1193,14 +1446,21 @@ def admin_gateways(request):
         gateway.name = name
         gateway.account_name = account_name
         gateway.account_number = account_number
-        gateway.active = True
+        if "active" in request.data:
+            gateway.active = str(request.data.get("active")).lower() in ("1", "true", "on", "yes")
+        picture = request.FILES.get("image")
+        if picture:
+            picture = image_upload(picture)
+            if not picture:
+                return Response({"detail": "Payment icon must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+            gateway.image = picture
         gateway.save()
-    return Response([{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number, "active": g.active} for g in Gateway.objects.all()])
+    return Response([{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number, "active": g.active, "image": media_url(g.image)} for g in Gateway.objects.all()])
 
 
 @api_view(["GET", "POST"])
 def admin_settings(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     settings = SiteSetting.current()
     if request.method == "POST":
@@ -1212,18 +1472,21 @@ def admin_settings(request):
 
 @api_view(["GET"])
 def admin_rewards(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     return Response([{"id": r.id, "level": r.level, "title": r.title, "required_team": r.required_team, "prize": r.prize, "active": r.active} for r in Reward.objects.all()])
 
 
 @api_view(["GET"])
 def admin_levels(request):
-    if not require_admin(request.user):
+    if not require_admin(request):
         return Response(status=403)
     settings = SiteSetting.current()
     return Response({"levels": [
-        {"level": 1, "name": "Direct Referral Commission", "percent": money(settings.direct_percent)},
-        {"level": 2, "name": "Level 2 – Indirect Referral Commission", "percent": money(settings.level2_percent)},
-        {"level": 3, "name": "Level 3 – Indirect Referral Commission", "percent": money(settings.level3_percent)},
-    ], "plans": [{"id": p.id, "name": p.name, "price": money(p.price)} for p in Plan.objects.all()]})
+        {"level": 1, "name": settings.direct_label or "Direct Referral Commission", "percent": money(settings.direct_percent)},
+        {"level": 2, "name": settings.level2_label or "Level 2 – Indirect Referral Commission", "percent": money(settings.level2_percent)},
+        {"level": 3, "name": settings.level3_label or "Level 3 – Indirect Referral Commission", "percent": money(settings.level3_percent)},
+    ], "direct_label": settings.direct_label, "level2_label": settings.level2_label, "level3_label": settings.level3_label,
+        "direct": money(settings.direct_percent), "level2": money(settings.level2_percent), "level3": money(settings.level3_percent),
+        "upgrade_commission_percent": money(settings.upgrade_commission_percent),
+        "plans": [{"id": p.id, "name": p.name, "price": money(p.price)} for p in Plan.objects.all()]})

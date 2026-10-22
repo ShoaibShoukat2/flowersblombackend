@@ -1,5 +1,5 @@
 from django.urls import path
-from . import views
+from . import desk, views
 
 urlpatterns = [
     path("auth/login", views.login),
@@ -37,4 +37,16 @@ urlpatterns = [
     path("admin/settings", views.admin_settings),
     path("admin/rewards", views.admin_rewards),
     path("admin/levels", views.admin_levels),
+    path("admin/levels/save", desk.save_levels),
+    path("admin/users/<int:pk>/adjust", desk.adjust_balance),
+    path("admin/users/<int:pk>/ban", desk.ban_user),
+    path("admin/users/<int:pk>/password", desk.user_password),
+    path("admin/users/<int:pk>/impersonate", desk.impersonate),
+    path("auth/impersonate", desk.impersonate_exchange),
+    path("admin/account", desk.admin_account),
+    path("admin/sessions", desk.admin_sessions),
+    path("admin/today-approved", desk.today_approved),
+    path("admin/upgrade-board", desk.upgrade_board),
+    path("admin/channels/<int:pk>", desk.channel_edit),
+    path("admin/contacts/save", desk.contact_save),
 ]

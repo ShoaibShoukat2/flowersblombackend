@@ -30,6 +30,8 @@ class User(AbstractUser):
     flower_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     flower_credited = models.BooleanField(default=False)
     activated_at = models.DateTimeField(null=True, blank=True)
+    ban_reason = models.TextField(blank=True, default="")
+    banned_at = models.DateTimeField(null=True, blank=True)
 
     def display_name(self):
         return self.full_name or self.username
@@ -41,6 +43,10 @@ class SiteSetting(models.Model):
     direct_percent = models.DecimalField(max_digits=5, decimal_places=2, default=25)
     level2_percent = models.DecimalField(max_digits=5, decimal_places=2, default=3)
     level3_percent = models.DecimalField(max_digits=5, decimal_places=2, default=1)
+    direct_label = models.CharField(max_length=80, default="Direct Referral Commission")
+    level2_label = models.CharField(max_length=80, default="Level 2 – Indirect Referral Commission")
+    level3_label = models.CharField(max_length=80, default="Level 3 – Indirect Referral Commission")
+    upgrade_commission_percent = models.DecimalField(max_digits=5, decimal_places=2, default=20)
 
     @classmethod
     def current(cls):
@@ -66,6 +72,8 @@ class ContactAdmin(models.Model):
     role = models.CharField(max_length=120, blank=True)
     whatsapp = models.CharField(max_length=40, blank=True)
     note = models.CharField(max_length=255, blank=True)
+    purpose = models.CharField(max_length=255, blank=True, default="")
+    number_type = models.CharField(max_length=20, default="whatsapp")
 
 
 class Gateway(models.Model):
@@ -73,6 +81,7 @@ class Gateway(models.Model):
     account_name = models.CharField(max_length=120, blank=True)
     account_number = models.CharField(max_length=80, blank=True)
     active = models.BooleanField(default=True)
+    image = models.FileField(upload_to="gateways/", blank=True, null=True)
 
 
 class Reward(models.Model):
@@ -124,8 +133,10 @@ class Deposit(models.Model):
     sender = models.CharField(max_length=80, blank=True)
     screenshot = models.FileField(upload_to="payments/", blank=True, null=True)
     status = models.CharField(max_length=20, default=PENDING)
+    reject_reason = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
 
 
 class Withdrawal(models.Model):
@@ -139,6 +150,7 @@ class Withdrawal(models.Model):
     account = models.CharField(max_length=80)
     flower_part = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     status = models.CharField(max_length=20, default=PENDING)
+    admin_remark = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(null=True, blank=True)
 
@@ -155,7 +167,41 @@ class UpgradeRequest(models.Model):
     sender = models.CharField(max_length=80, blank=True)
     screenshot = models.FileField(upload_to="payments/", blank=True, null=True)
     status = models.CharField(max_length=20, default=PENDING)
+    reject_reason = models.TextField(blank=True, default="")
+    pay_commission = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+
+
+class BalanceAdjustment(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="adjustments")
+    admin = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="adjustments_made")
+    kind = models.CharField(max_length=20)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    reason = models.TextField()
+    before_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    after_amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+    request_key = models.CharField(max_length=80, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class ImpersonationGrant(models.Model):
+    admin = models.ForeignKey(User, on_delete=models.CASCADE, related_name="impersonations_started")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="impersonations_received")
+    code = models.CharField(max_length=64, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    used_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+
+
+class AdminSession(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="admin_sessions")
+    key = models.CharField(max_length=64, unique=True)
+    user_agent = models.CharField(max_length=255, blank=True)
+    ip = models.CharField(max_length=80, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_seen = models.DateTimeField(auto_now=True)
+    revoked = models.BooleanField(default=False)
 
 
 class Transaction(models.Model):
