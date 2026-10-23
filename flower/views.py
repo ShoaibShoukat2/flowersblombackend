@@ -5,6 +5,7 @@ from uuid import uuid4
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
 from django.db.models import Count, Q, Sum
+from django.db.models.functions import Lower
 from django.http import FileResponse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
@@ -604,8 +605,9 @@ def withdrawals(request):
         account = (request.data.get("account") or "").strip()
         if amount <= 0 or not method or not account_name or not account:
             return Response({"detail": "Enter an amount above zero, plus the method, account name, and account number."}, status=400)
-        active_names = {g.name.lower().replace(" ", "") for g in Gateway.objects.filter(active=True)}
-        if method.lower().replace(" ", "") not in active_names:
+        allowed = withdrawal_methods()
+        method = canonical_gateway_name(method)
+        if method not in allowed:
             return Response({"detail": "That payment method is not available."}, status=400)
         amount = amount.quantize(Decimal("0.01"))
         with transaction.atomic():
@@ -638,13 +640,57 @@ def withdrawals(request):
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "approved_at": item.updated_at.isoformat() if item.status == Withdrawal.APPROVED and item.updated_at else None,
         })
-    methods = [g.name for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()]
-    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable), "methods": methods})
+    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable), "methods": withdrawal_methods()})
 
 
 @api_view(["GET"])
 def contacts(request):
     return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
+
+
+def canonical_gateway_name(name):
+    raw = " ".join((name or "").split())
+    key = raw.lower().replace(" ", "")
+    if key == "jazzcash":
+        return "JazzCash"
+    if key == "easypaisa":
+        return "Easypaisa"
+    if not raw or len(raw) > 80:
+        return ""
+    return raw
+
+
+def withdrawal_methods():
+    names = []
+    for gateway in payment_gateways(require_number=False):
+        label = canonical_gateway_name(gateway.name)
+        if label and label not in names:
+            names.append(label)
+    return names
+
+
+def payment_gateways(active_only=True, require_number=True):
+    rows = []
+    for gateway in Gateway.objects.all().order_by("id"):
+        if not canonical_gateway_name(gateway.name):
+            continue
+        if active_only and not gateway.active:
+            continue
+        if require_number and not (gateway.account_number or "").strip():
+            continue
+        rows.append(gateway)
+    return rows
+
+
+def gateway_public(gateway):
+    return {
+        "id": gateway.id,
+        "name": canonical_gateway_name(gateway.name),
+        "account_name": gateway.account_name,
+        "account_number": gateway.account_number,
+        "image": media_url(gateway.image),
+        "active": gateway.active,
+    }
 
 
 @api_view(["GET"])
@@ -656,7 +702,7 @@ def plans(request):
         "current_plan_id": user.plan_id,
         "current_plan": user.plan.name if user.plan else None,
         "plans": [{"id": p.id, "name": p.name, "price": money(p.price), "daily_tasks": p.daily_tasks, "color": p.color, "text_color": p.text_color} for p in Plan.objects.all()],
-        "gateways": [{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number, "image": media_url(g.image)} for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()],
+        "gateways": [gateway_public(gateway) for gateway in payment_gateways()],
         "current_price": money(user.plan.price) if user.plan_id else "0.00",
         "pending_deposit": None if not pending else {"id": pending.id, "plan_id": pending.plan_id, "plan": pending.plan.name if pending.plan else "", "amount": money(pending.amount), "method": pending.method, "sender": pending.sender, "status": pending.status, "has_screenshot": bool(pending.screenshot)},
         "pending_upgrade": None if not upgrade else {"id": upgrade.id, "plan_id": upgrade.to_plan_id, "plan": upgrade.to_plan.name if upgrade.to_plan else "", "amount": money(upgrade.amount), "method": upgrade.method, "sender": upgrade.sender, "status": upgrade.status, "has_screenshot": bool(upgrade.screenshot)},
@@ -680,11 +726,22 @@ def deposit_create(request):
     shot = image_upload(request.FILES.get("screenshot"))
     if not shot:
         return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
-    chosen_methods = [part.strip() for part in method.split("/") if part.strip()]
-    active_gateways = [g for g in Gateway.objects.filter(active=True) if g.name.lower().replace(" ", "") in ("jazzcash", "easypaisa") and (g.account_number or "").strip()]
-    active_names = {g.name.lower().replace(" ", "") for g in active_gateways}
-    if not chosen_methods or any(part.lower().replace(" ", "") not in active_names for part in chosen_methods):
-        return Response({"detail": "That payment method is not available."}, status=400)
+    accounts = payment_gateways()
+    gateway_id = request.data.get("gateway_id")
+    account = None
+    if str(gateway_id or "").isdigit():
+        account = next((item for item in accounts if item.id == int(gateway_id)), None)
+    if account is None:
+        number = method.split("·")[-1].strip()
+        account = next((item for item in accounts if item.account_number == number or item.account_number == method), None)
+    if account is None:
+        key = canonical_gateway_name(method.split("·")[0])
+        named = [item for item in accounts if canonical_gateway_name(item.name) == key]
+        if len(named) == 1:
+            account = named[0]
+    if account is None:
+        return Response({"detail": "That payment account is not available."}, status=400)
+    method = f"{canonical_gateway_name(account.name)} · {account.account_number}"
     if user.plan_id:
         if plan.id == user.plan_id:
             return Response({"detail": "This is already your current plan."}, status=400)
@@ -940,30 +997,24 @@ def person_brief(user):
 
 
 def team_pack(user):
+    qs = user.team.select_related("plan")
     members = []
-    total = active = pending = 0
-    for member in user.team.select_related("plan").order_by("-id"):
-        total += 1
-        if member.plan_id and member.account_status == "approved":
-            active += 1
-        elif member.account_status == "pending":
-            pending += 1
-        if len(members) < 400:
-            members.append({
-                "id": member.id,
-                "full_name": member.display_name(),
-                "email": member.email,
-                "phone": member.phone or "",
-                "plan": member.plan.name if member.plan_id else None,
-                "level": member.level,
-                "status": member.account_status,
-                "paid": bool(member.plan_id),
-                "joined": member.date_joined.isoformat(),
-            })
+    for member in qs.order_by("-id")[:40]:
+        members.append({
+            "id": member.id,
+            "full_name": member.display_name(),
+            "email": member.email,
+            "phone": member.phone or "",
+            "plan": member.plan.name if member.plan_id else None,
+            "level": member.level,
+            "status": member.account_status,
+            "paid": bool(member.plan_id),
+            "joined": member.date_joined.isoformat(),
+        })
     return {
-        "total": total,
-        "active": active,
-        "pending": pending,
+        "total": qs.count(),
+        "active": qs.filter(plan__isnull=False, account_status="approved").count(),
+        "pending": qs.filter(account_status="pending").count(),
         "level2": User.objects.filter(referred_by__referred_by=user, role="user").count(),
         "level3": User.objects.filter(referred_by__referred_by__referred_by=user, role="user").count(),
         "shown": len(members),
@@ -971,9 +1022,119 @@ def team_pack(user):
     }
 
 
-def member_row(user):
-    deposit = user.deposits.order_by("-id").first()
-    when = deposit.updated_at if deposit and deposit.status == Deposit.APPROVED else user.date_joined
+def looks_like_email(raw):
+    text = (raw or "").strip()
+    return "@" in text and " " not in text and len(text) <= 180
+
+
+def account_search(qs, raw, email_field="email"):
+    text = (raw or "").strip()
+    if not text:
+        return qs
+    if looks_like_email(text):
+        return qs.filter(**{f"{email_field}__iexact": text})
+    return qs.filter(
+        Q(**{f"{email_field}__istartswith": text})
+        | Q(full_name__istartswith=text)
+        | Q(username__istartswith=text)
+        | Q(phone__startswith=text)
+    )
+
+
+def related_search(qs, raw, extras=()):
+    text = (raw or "").strip()
+    if not text:
+        return qs
+    if looks_like_email(text):
+        return qs.filter(user__email__iexact=text)
+    cond = (
+        Q(user__email__istartswith=text)
+        | Q(user__full_name__istartswith=text)
+        | Q(user__username__istartswith=text)
+        | Q(user__phone__startswith=text)
+    )
+    if any(ch.isdigit() for ch in text):
+        for field in extras:
+            cond |= Q(**{f"{field}__icontains": text})
+    return qs.filter(cond)
+
+
+def page_bounds(request, default=40, cap=60):
+    try:
+        page = max(1, int(request.GET.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(request.GET.get("limit") or default)
+    except (TypeError, ValueError):
+        size = default
+    return page, max(1, min(size, cap))
+
+
+def slice_page(qs, page, size):
+    count = qs.count()
+    pages = max(1, (count + size - 1) // size) if count else 1
+    page = min(page, pages)
+    start = (page - 1) * size
+    return qs[start:start + size], count, page, pages
+
+
+def paged(rows, count, page, pages):
+    return {"rows": rows, "count": count, "page": page, "pages": pages}
+
+
+def apply_day_range(qs, request, field="created_at"):
+    raw = (request.GET.get("date") or "").strip()
+    if raw:
+        chosen = parse_day(raw)
+        return between(qs, field, chosen) if chosen else qs
+    start = (request.GET.get("start") or "").strip()
+    end = (request.GET.get("end") or "").strip()
+    if start:
+        day = parse_day(start)
+        if day:
+            qs = qs.filter(**{f"{field}__date__gte": day})
+    if end:
+        day = parse_day(end)
+        if day:
+            qs = qs.filter(**{f"{field}__date__lte": day})
+    return qs
+
+
+def source_ids(emails):
+    cleaned = sorted({(email or "").strip().lower() for email in emails if email and "@" in email})
+    if not cleaned:
+        return {}
+    found = User.objects.annotate(mail=Lower("email")).filter(mail__in=cleaned).values_list("mail", "id")
+    return {mail: pk for mail, pk in found}
+
+
+def team_card(user):
+    return {
+        "id": user.id,
+        "full_name": user.display_name(),
+        "email": user.email,
+        "phone": user.phone or "",
+        "username": user.username,
+        "plan": user.plan.name if user.plan_id else None,
+        "plan_color": user.plan.color if user.plan_id else "#fff3cd",
+        "plan_text": user.plan.text_color if user.plan_id else "#856404",
+        "paid": bool(user.plan_id),
+        "balance": money(user.balance),
+        "level": user.level,
+        "status": user.account_status,
+        "date": (user.activated_at or user.date_joined).isoformat(),
+        "joined": user.date_joined.isoformat(),
+        "approved_at": user.activated_at.isoformat() if user.activated_at else None,
+    }
+
+
+def member_row(user, light=False):
+    when = user.date_joined
+    if not light:
+        deposit = user.deposits.order_by("-id").first()
+        if deposit and deposit.status == Deposit.APPROVED:
+            when = deposit.updated_at
     return {
         "id": user.id,
         "full_name": user.display_name(),
@@ -985,11 +1146,12 @@ def member_row(user):
         "paid": bool(user.plan_id),
         "balance": money(user.balance),
         "level": user.level,
-        "active_team": user.team.filter(plan__isnull=False).count(),
-        "earnings": money(user.transactions.filter(trx_type="+").aggregate(s=Sum("amount"))["s"] or 0),
+        "active_team": 0 if light else user.team.filter(plan__isnull=False).count(),
+        "earnings": "0.00" if light else money(user.transactions.filter(trx_type="+").aggregate(s=Sum("amount"))["s"] or 0),
         "status": user.account_status,
-        "date": when.isoformat(),
+        "date": when.isoformat() if when else None,
         "phone": user.phone,
+        "banned": user.account_status == "banned" or bool(user.banned_at),
     }
 
 
@@ -1008,10 +1170,30 @@ def admin_users(request):
         qs = qs.filter(account_status="rejected")
     elif status == "today":
         qs = qs.filter(deposits__status=Deposit.APPROVED, deposits__updated_at__date=today).distinct()
-    q = (request.GET.get("q") or "").strip()
-    if q:
-        qs = qs.filter(Q(full_name__icontains=q) | Q(email__icontains=q) | Q(phone__icontains=q) | Q(username__icontains=q) | Q(referral_code__icontains=q))
-    return Response([member_row(u) for u in qs.order_by("-id")[:200]])
+    qs = account_search(qs, request.GET.get("q"))
+    qs = qs.order_by("-id")
+    page, size = page_bounds(request, 40, 40)
+    if request.GET.get("suggest") == "1":
+        size = min(size, 8)
+        return Response([
+            {"id": u.id, "full_name": u.display_name(), "email": u.email, "phone": u.phone or "", "status": u.account_status}
+            for u in qs[:size]
+        ])
+    chunk, count, page, pages = slice_page(qs, page, size)
+    return Response(paged([member_row(u, light=True) for u in chunk], count, page, pages))
+
+
+def deposit_slip_row(deposit):
+    return {
+        "id": deposit.id,
+        "plan": deposit.plan.name if deposit.plan_id else None,
+        "amount": money(deposit.amount),
+        "method": deposit.method,
+        "sender": deposit.sender,
+        "status": deposit.status,
+        "created_at": deposit.created_at.isoformat(),
+        "screenshot": slip_url("deposits", deposit.id, deposit.screenshot),
+    }
 
 
 @api_view(["GET"])
@@ -1021,71 +1203,187 @@ def admin_user_detail(request, pk):
     user = User.objects.select_related("plan", "referred_by", "referred_by__plan").filter(pk=pk, role="user").first()
     if not user:
         return Response(status=404)
-    team = [member_row(m) for m in user.team.select_related("plan").order_by("-id")]
-    txs = [tx_public(tx, include_email=True) for tx in user.transactions.all()[:40]]
-    slips = []
-    for deposit in user.deposits.select_related("plan").order_by("-id")[:12]:
-        slips.append({
-            "id": deposit.id,
-            "plan": deposit.plan.name if deposit.plan else None,
-            "amount": money(deposit.amount),
-            "method": deposit.method,
-            "sender": deposit.sender,
-            "status": deposit.status,
-            "created_at": deposit.created_at.isoformat(),
-            "screenshot": slip_url("deposits", deposit.id, deposit.screenshot),
-        })
-    withdrawals = []
-    for item in user.withdrawals.order_by("-id")[:12]:
-        withdrawals.append({
-            "id": item.id,
-            "amount": money(item.amount),
-            "method": item.method,
-            "account_name": item.account_name,
-            "account": item.account,
-            "status": item.status,
-            "created_at": item.created_at.isoformat(),
-        })
-    upgrades = []
-    for row in UpgradeRequest.objects.filter(user=user).select_related("from_plan", "to_plan").order_by("-id")[:12]:
-        upgrades.append({
-            "id": row.id,
-            "from_plan": row.from_plan.name if row.from_plan else "—",
-            "to_plan": row.to_plan.name if row.to_plan else "—",
-            "amount": money(row.amount),
-            "method": row.method,
-            "sender": row.sender,
-            "status": row.status,
-            "created_at": row.created_at.isoformat(),
-            "screenshot": slip_url("upgrades", row.id, row.screenshot),
-        })
+    team_qs = user.team.select_related("plan")
+    paid_team = team_qs.filter(plan__isnull=False).count()
+    unpaid_team = team_qs.filter(plan__isnull=True).count()
+    preview = [team_card(m) for m in team_qs.order_by("-id")[:6]]
+    slips = [deposit_slip_row(deposit) for deposit in user.deposits.select_related("plan").order_by("-id")[:20]]
+    banned = user.account_status == "banned" or bool(user.banned_at)
     return Response({
-        "user": member_row(user),
+        "user": member_row(user, light=True),
         "profile": {
             "balance": money(user.balance),
             "deposits": money(_sum(user.deposits.filter(status=Deposit.APPROVED))),
             "withdrawals": money(_sum(user.withdrawals.filter(status=Withdrawal.APPROVED))),
             "transactions": user.transactions.count(),
-            "team": len(team),
+            "team": paid_team + unpaid_team,
+            "paid_team": paid_team,
+            "unpaid_team": unpaid_team,
+            "approved_team": paid_team,
             "level": user.level,
             "phone": user.phone or "",
             "email": user.email,
             "full_name": user.display_name(),
             "referral_code": user.referral_code,
             "flower_balance": money(user.flower_balance),
-            "status": user.account_status,
+            "status": "banned" if banned else user.account_status,
             "first_name": user.first_name or "",
             "last_name": user.last_name or "",
             "ban_reason": user.ban_reason or "",
+            "banned": banned,
             "plan": user.plan.name if user.plan else "",
         },
         "upliner": person_brief(user.referred_by),
-        "team": team,
-        "transactions": txs,
+        "team": preview,
         "deposits": slips,
-        "withdrawals": withdrawals,
-        "upgrades": upgrades,
     })
+
+
+def user_tx_category(qs, category):
+    if category in ("", "all"):
+        return qs
+    if category == "overall":
+        return qs.filter(trx_type="+", remark__in=["ads", "referral", "flower", "flower_add", "restore20", "upgrade_referral"])
+    if category == "ads_earn":
+        return qs.filter(remark="ads", trx_type="+", title__icontains="ads")
+    if category == "task":
+        return qs.filter(remark="ads", trx_type="+").exclude(title__icontains="ads")
+    if category == "flower":
+        return qs.filter(remark__in=["flower", "flower_add", "flower_sub"])
+    if category in ("balance_add", "manual_add"):
+        return qs.filter(remark="balance_add", trx_type="+")
+    if category in ("balance_sub", "manual_sub"):
+        return qs.filter(remark__in=["balance_sub", "balance_subtract"], trx_type="-")
+    if category in ("direct", "direct_traffic"):
+        return qs.filter(remark="referral", level=1)
+    if category in ("indirect_1", "level_2"):
+        return qs.filter(remark="referral", level=2)
+    if category in ("indirect_2", "level_3"):
+        return qs.filter(remark="referral", level=3)
+    if category == "referral":
+        return qs.filter(remark="referral", trx_type="+")
+    if category == "withdraw":
+        return qs.filter(remark="withdraw")
+    if category == "ads":
+        return qs.filter(remark="ads", trx_type="+")
+    return qs
+
+
+def tx_page(qs, request):
+    q = (request.GET.get("q") or "").strip()
+    if q:
+        if looks_like_email(q):
+            qs = qs.filter(Q(user__email__iexact=q) | Q(source_email__iexact=q))
+        else:
+            qs = qs.filter(Q(user__email__istartswith=q) | Q(user__full_name__istartswith=q) | Q(title__icontains=q) | Q(source_email__istartswith=q))
+    qs = apply_day_range(qs, request, "created_at")
+    page, size = page_bounds(request, 40, 80)
+    total = money(_sum(qs))
+    count = qs.count()
+    pages = max(1, (count + size - 1) // size) if count else 1
+    page = min(page, pages)
+    start = (page - 1) * size
+    chosen = parse_day((request.GET.get("date") or "").strip()) if (request.GET.get("date") or "").strip() else None
+    chunk = list(qs.select_related("user")[start:start + size])
+    found = source_ids([tx.source_email for tx in chunk])
+    rows = []
+    for tx in chunk:
+        item = tx_public(tx, include_email=True)
+        item["user_id"] = tx.user_id
+        item["user_name"] = tx.user.display_name()
+        item["user_email"] = tx.user.email
+        item["source_user_id"] = found.get((tx.source_email or "").strip().lower())
+        rows.append(item)
+    return {
+        "total": total,
+        "count": count,
+        "page": page,
+        "pages": pages,
+        "date": chosen.isoformat() if chosen else "",
+        "rows": rows,
+    }
+
+
+@api_view(["GET"])
+def admin_user_transactions(request, pk):
+    if not require_admin(request):
+        return Response(status=403)
+    if not User.objects.filter(pk=pk, role="user").exists():
+        return Response(status=404)
+    qs = user_tx_category(Transaction.objects.filter(user_id=pk).select_related("user"), request.GET.get("category") or "")
+    return Response(tx_page(qs.order_by("-id"), request))
+
+
+@api_view(["GET"])
+def admin_user_withdrawals(request, pk):
+    if not require_admin(request):
+        return Response(status=403)
+    user = User.objects.filter(pk=pk, role="user").first()
+    if not user:
+        return Response(status=404)
+    qs = user.withdrawals.order_by("-id")
+    q = (request.GET.get("q") or "").strip()
+    if q:
+        qs = qs.filter(Q(account__icontains=q) | Q(account_name__icontains=q) | Q(method__icontains=q))
+    qs = apply_day_range(qs, request, "created_at")
+    page, size = page_bounds(request, 40, 80)
+    chunk, count, page, pages = slice_page(qs, page, size)
+    rows = [{
+        "id": item.id,
+        "user_id": user.id,
+        "email": user.email,
+        "amount": money(item.amount),
+        "method": item.method,
+        "account_name": item.account_name,
+        "account": item.account,
+        "status": item.status,
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+    } for item in chunk]
+    return Response(paged(rows, count, page, pages))
+
+
+@api_view(["GET"])
+def admin_user_team(request, pk):
+    if not require_admin(request):
+        return Response(status=403)
+    user = User.objects.filter(pk=pk, role="user").first()
+    if not user:
+        return Response(status=404)
+    qs = user.team.select_related("plan")
+    paid = (request.GET.get("paid") or "").strip()
+    if paid == "1":
+        qs = qs.filter(plan__isnull=False)
+    elif paid == "0":
+        qs = qs.filter(plan__isnull=True)
+    plan = (request.GET.get("plan") or "").strip()
+    if plan == "none":
+        qs = qs.filter(plan__isnull=True)
+    elif plan:
+        qs = qs.filter(plan__name__iexact=plan)
+    qs = account_search(qs, request.GET.get("q"))
+    approved = (request.GET.get("approved") or "").strip()
+    rejected = (request.GET.get("rejected") or "").strip()
+    if approved:
+        day = parse_day(approved)
+        if day:
+            qs = qs.filter(activated_at__date=day)
+    if rejected:
+        day = parse_day(rejected)
+        if day:
+            rejected_ids = Deposit.objects.filter(status=Deposit.REJECTED, updated_at__date=day, user__referred_by=user).values("user_id")
+            qs = qs.filter(id__in=rejected_ids)
+    counts = []
+    for row in user.team.values("plan__name").annotate(count=Count("id")).order_by("plan__name"):
+        counts.append({"name": row["plan__name"] or "No plan", "count": row["count"]})
+    page, size = page_bounds(request, 40, 80)
+    chunk, count, page, pages = slice_page(qs.order_by("-id"), page, size)
+    payload = paged([team_card(m) for m in chunk], count, page, pages)
+    payload["plans"] = counts
+    payload["paid"] = user.team.filter(plan__isnull=False).count()
+    payload["unpaid"] = user.team.filter(plan__isnull=True).count()
+    payload["total"] = payload["paid"] + payload["unpaid"]
+    return Response(payload)
 
 
 @api_view(["GET"])
@@ -1107,55 +1405,8 @@ def leaderboard(request):
 def admin_transactions(request):
     if not require_admin(request):
         return Response(status=403)
-    qs = Transaction.objects.select_related("user").order_by("-id")
-    category = request.GET.get("category") or ""
-    if category == "direct_traffic":
-        qs = qs.filter(remark="referral", level=1)
-    elif category == "level_2":
-        qs = qs.filter(level=2)
-    elif category == "level_3":
-        qs = qs.filter(level=3)
-    elif category == "withdraw":
-        qs = qs.filter(remark="withdraw")
-    elif category == "ads":
-        qs = task_earnings()
-    elif category == "manual_add":
-        qs = manual_additions()
-    elif category == "manual_sub":
-        qs = manual_subtractions()
-    elif category == "referral":
-        qs = referral_commissions()
-    q = (request.GET.get("q") or "").strip()
-    if q:
-        qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(title__icontains=q) | Q(source_email__icontains=q))
-    raw_date = (request.GET.get("date") or "").strip()
-    chosen = parse_day(raw_date) if raw_date else None
-    if chosen:
-        qs = between(qs, "created_at", chosen)
-    try:
-        page = max(1, int(request.GET.get("page") or 1))
-    except ValueError:
-        page = 1
-    page_size = 80
-    count = qs.count()
-    pages = max(1, (count + page_size - 1) // page_size)
-    page = min(page, pages)
-    start = (page - 1) * page_size
-    rows = []
-    for tx in qs.select_related("user")[start:start + page_size]:
-        item = tx_public(tx, include_email=True)
-        item["user_id"] = tx.user_id
-        item["user_name"] = tx.user.display_name()
-        item["user_email"] = tx.user.email
-        rows.append(item)
-    return Response({
-        "total": money(_sum(qs)),
-        "count": count,
-        "page": page,
-        "pages": pages,
-        "date": chosen.isoformat() if chosen else "",
-        "rows": rows,
-    })
+    qs = user_tx_category(Transaction.objects.all(), request.GET.get("category") or "")
+    return Response(tx_page(qs.order_by("-id"), request))
 
 
 @api_view(["GET"])
@@ -1173,10 +1424,21 @@ def admin_deposits(request):
         qs = between(qs, "created_at", parse_day(request.GET.get("date")))
     if request.GET.get("plan"):
         qs = qs.filter(plan__name__iexact=request.GET.get("plan"))
-    q = (request.GET.get("q") or "").strip()
-    if q:
-        qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(sender__icontains=q) | Q(method__icontains=q))
-    return Response([{
+    qs = related_search(qs, request.GET.get("q"), extras=("sender",))
+    if request.GET.get("suggest") == "1":
+        seen = []
+        out = []
+        for row in qs[:40]:
+            if row.user_id in seen:
+                continue
+            seen.append(row.user_id)
+            out.append({"id": row.user_id, "full_name": row.user.display_name(), "email": row.user.email, "phone": row.user.phone or "", "status": row.status})
+            if len(out) >= 8:
+                break
+        return Response(out)
+    page, size = page_bounds(request, 40, 40)
+    chunk, count, page, pages = slice_page(qs, page, size)
+    rows = [{
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
         "username": d.user.username, "phone": d.user.phone or "",
         "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
@@ -1184,7 +1446,8 @@ def admin_deposits(request):
         "reject_reason": d.reject_reason, "approved_at": d.approved_at.isoformat() if d.approved_at else None,
         "screenshot": slip_url("deposits", d.id, d.screenshot),
         "upliner": person_brief(d.user.referred_by),
-    } for d in qs])
+    } for d in chunk]
+    return Response(paged(rows, count, page, pages))
 
 
 @api_view(["GET"])
@@ -1260,16 +1523,38 @@ def admin_withdrawals(request):
         qs = qs.filter(status=status)
     if request.GET.get("today") == "1" or request.GET.get("date"):
         qs = approved_withdrawals_on(parse_day(request.GET.get("date") or "today")).select_related("user").order_by("-updated_at", "-id")
-    q = (request.GET.get("q") or "").strip()
-    if q:
-        qs = qs.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(user__phone__icontains=q) | Q(account__icontains=q) | Q(method__icontains=q) | Q(user__username__icontains=q))
-    return Response([{
+    qs = related_search(qs, request.GET.get("q"), extras=("account",))
+    if request.GET.get("suggest") == "1":
+        seen = []
+        out = []
+        for row in qs[:40]:
+            if row.user_id in seen:
+                continue
+            seen.append(row.user_id)
+            out.append({"id": row.user_id, "full_name": row.user.display_name(), "email": row.user.email, "phone": row.user.phone or ""})
+            if len(out) >= 8:
+                break
+        return Response(out)
+    page, size = page_bounds(request, 40, 40)
+    chunk, count, page, pages = slice_page(qs, page, size)
+    rows = [{
         "id": w.id, "user_id": w.user_id, "full_name": w.user.display_name(), "email": w.user.email,
         "username": w.user.username, "phone": w.user.phone or "",
         "amount": money(w.amount), "method": w.method, "account_name": w.account_name, "account": w.account, "status": w.status,
         "admin_remark": w.admin_remark, "created_at": w.created_at.isoformat(),
         "approved_at": w.updated_at.isoformat() if w.status == Withdrawal.APPROVED and w.updated_at else None,
-    } for w in qs])
+    } for w in chunk]
+    return Response(paged(rows, count, page, pages))
+
+
+@api_view(["GET"])
+def withdrawal_summary(request):
+    if not require_admin(request):
+        return Response(status=403)
+    return Response({
+        "pending": money(_sum(Withdrawal.objects.filter(status=Withdrawal.PENDING))),
+        "rejected": money(_sum(Withdrawal.objects.filter(status=Withdrawal.REJECTED))),
+    })
 
 
 @api_view(["GET", "POST"])
@@ -1317,10 +1602,21 @@ def admin_upgrades(request):
     rows = UpgradeRequest.objects.select_related("user", "from_plan", "to_plan").order_by("-id")
     if status != "all":
         rows = rows.filter(status=status)
-    q = (request.GET.get("q") or "").strip()
-    if q:
-        rows = rows.filter(Q(user__full_name__icontains=q) | Q(user__email__icontains=q) | Q(sender__icontains=q) | Q(method__icontains=q))
-    return Response([{
+    rows = related_search(rows, request.GET.get("q"), extras=("sender",))
+    if request.GET.get("suggest") == "1":
+        seen = []
+        out = []
+        for row in rows[:40]:
+            if row.user_id in seen:
+                continue
+            seen.append(row.user_id)
+            out.append({"id": row.user_id, "full_name": row.user.display_name(), "email": row.user.email, "phone": row.user.phone or ""})
+            if len(out) >= 8:
+                break
+        return Response(out)
+    page, size = page_bounds(request, 40, 40)
+    chunk, count, page, pages = slice_page(rows, page, size)
+    return Response(paged([{
         "id": r.id, "user_id": r.user_id, "full_name": r.user.display_name(), "email": r.user.email,
         "from_plan": r.from_plan.name if r.from_plan else "—", "to_plan": r.to_plan.name if r.to_plan else "—",
         "plan": r.to_plan.name if r.to_plan else "—", "amount": money(r.amount), "method": r.method,
@@ -1330,7 +1626,7 @@ def admin_upgrades(request):
         "username": r.user.username, "phone": r.user.phone or "",
         "upliner": person_brief(r.user.referred_by),
         "screenshot": slip_url("upgrades", r.id, r.screenshot),
-    } for r in rows])
+    } for r in chunk], count, page, pages))
 
 
 @api_view(["POST"])
@@ -1427,21 +1723,18 @@ def admin_gateways(request):
     if not require_admin(request):
         return Response(status=403)
     if request.method == "POST":
-        name = (request.data.get("name") or "").strip()
+        name = canonical_gateway_name(request.data.get("name") or "")
         account_name = (request.data.get("account_name") or "").strip()
         account_number = (request.data.get("account_number") or "").strip()
-        if name not in ("JazzCash", "Easypaisa"):
-            return Response({"detail": "Choose JazzCash or Easypaisa."}, status=400)
-        if not account_number:
-            return Response({"detail": "Enter the account number."}, status=400)
-        gateway = None
         pk = request.data.get("id")
-        if str(pk or "").isdigit():
-            gateway = Gateway.objects.filter(pk=pk).first()
-        if not gateway:
-            key = name.lower()
-            gateway = next((item for item in Gateway.objects.all() if item.name.lower().replace(" ", "") == key), None)
-        if not gateway:
+        if str(request.data.get("delete") or "") in ("1", "true", "yes"):
+            if str(pk or "").isdigit():
+                Gateway.objects.filter(pk=pk).delete()
+            return Response([gateway_public(gateway) for gateway in payment_gateways(active_only=False)])
+        if not name:
+            return Response({"detail": "Enter the method name, such as JazzCash or Easypaisa."}, status=400)
+        gateway = Gateway.objects.filter(pk=pk).first() if str(pk or "").isdigit() else None
+        if gateway is None:
             gateway = Gateway(name=name)
         gateway.name = name
         gateway.account_name = account_name
@@ -1455,7 +1748,7 @@ def admin_gateways(request):
                 return Response({"detail": "Payment icon must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
             gateway.image = picture
         gateway.save()
-    return Response([{"id": g.id, "name": g.name, "account_name": g.account_name, "account_number": g.account_number, "active": g.active, "image": media_url(g.image)} for g in Gateway.objects.all()])
+    return Response([gateway_public(gateway) for gateway in payment_gateways(active_only=False)])
 
 
 @api_view(["GET", "POST"])

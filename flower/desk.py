@@ -97,17 +97,24 @@ def adjust_balance(request, pk):
 def ban_user(request, pk):
     if not require_admin(request):
         return Response(status=403)
-    reason = (request.data.get("reason") or "").strip()
-    if not reason:
-        return Response({"detail": "A ban reason is required."}, status=400)
     user = User.objects.filter(pk=pk, role="user").first()
     if not user:
         return Response(status=404)
+    action = (request.data.get("action") or "ban").strip().lower()
+    if action == "unban":
+        user.account_status = "approved" if user.plan_id else "pending"
+        user.ban_reason = ""
+        user.banned_at = None
+        user.save(update_fields=["account_status", "ban_reason", "banned_at"])
+        return Response({"ok": True, "status": user.account_status, "banned": False})
+    reason = (request.data.get("reason") or "").strip()
+    if not reason:
+        return Response({"detail": "A ban reason is required."}, status=400)
     user.account_status = "banned"
     user.ban_reason = reason
     user.banned_at = timezone.now()
     user.save(update_fields=["account_status", "ban_reason", "banned_at"])
-    return Response({"ok": True})
+    return Response({"ok": True, "status": "banned", "banned": True})
 
 
 @api_view(["POST"])
@@ -229,7 +236,10 @@ def today_approved(request):
     plan = (request.GET.get("plan") or "").strip()
     deposits = approved_deposits_on(day).select_related("user", "user__plan", "user__referred_by", "plan")
     if q:
-        deposits = deposits.filter(Q(user__full_name__icontains=q) | Q(user__username__icontains=q) | Q(user__email__icontains=q) | Q(user__phone__icontains=q))
+        if "@" in q and " " not in q:
+            deposits = deposits.filter(user__email__iexact=q)
+        else:
+            deposits = deposits.filter(Q(user__full_name__istartswith=q) | Q(user__username__istartswith=q) | Q(user__email__istartswith=q) | Q(user__phone__startswith=q))
     if plan:
         deposits = deposits.filter(plan__name__iexact=plan)
     from .views import slip_url

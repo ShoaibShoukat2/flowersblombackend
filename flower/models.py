@@ -36,6 +36,12 @@ class User(AbstractUser):
     def display_name(self):
         return self.full_name or self.username
 
+    class Meta:
+        indexes = [
+            models.Index(fields=["email"], name="flower_user_email_idx"),
+            models.Index(fields=["account_status"], name="flower_user_acct_status"),
+        ]
+
 
 class SiteSetting(models.Model):
     notice = models.TextField(default="Welcome to Flower. Complete your tasks and grow your team.")
@@ -138,6 +144,9 @@ class Deposit(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     approved_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta:
+        indexes = [models.Index(fields=["status", "id"], name="flower_deposit_status_id")]
+
 
 class Withdrawal(models.Model):
     PENDING = "pending"
@@ -153,6 +162,9 @@ class Withdrawal(models.Model):
     admin_remark = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["status", "id"], name="flower_withdraw_status_id")]
 
 
 class UpgradeRequest(models.Model):
@@ -217,3 +229,4 @@ class Transaction(models.Model):
 
     class Meta:
         ordering = ["-id"]
+        indexes = [models.Index(fields=["user", "remark", "id"], name="flower_tx_user_remark")]
