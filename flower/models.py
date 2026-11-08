@@ -79,9 +79,12 @@ class ContactAdmin(models.Model):
     name = models.CharField(max_length=120)
     role = models.CharField(max_length=120, blank=True)
     whatsapp = models.CharField(max_length=40, blank=True)
+    botim = models.CharField(max_length=40, blank=True, default="")
     note = models.CharField(max_length=255, blank=True)
     purpose = models.CharField(max_length=255, blank=True, default="")
     number_type = models.CharField(max_length=20, default="whatsapp")
+    whatsapp_icon = models.FileField(upload_to="contacts/", blank=True, null=True)
+    botim_icon = models.FileField(upload_to="contacts/", blank=True, null=True)
 
 
 class Gateway(models.Model):
@@ -166,6 +169,19 @@ class Deposit(models.Model):
         indexes = [models.Index(fields=["status", "id"], name="flower_deposit_status_id")]
 
 
+class DepositEditHistory(models.Model):
+    deposit = models.ForeignKey(Deposit, on_delete=models.CASCADE, related_name="edit_history")
+    editor = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    plan_name = models.CharField(max_length=80, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    method = models.CharField(max_length=80, blank=True)
+    sender = models.CharField(max_length=80, blank=True)
+    sender_name = models.CharField(max_length=120, blank=True)
+    trx_no = models.CharField(max_length=80, blank=True)
+    screenshot = models.FileField(upload_to="payments/history/", blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class Withdrawal(models.Model):
     PENDING = "pending"
     APPROVED = "approved"
@@ -202,6 +218,7 @@ class UpgradeRequest(models.Model):
     reject_reason = models.TextField(blank=True, default="")
     pay_commission = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
     approved_at = models.DateTimeField(null=True, blank=True)
 
 

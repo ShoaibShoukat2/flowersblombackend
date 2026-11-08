@@ -6,7 +6,7 @@ from django.core.cache import cache
 from django.db import IntegrityError, transaction
 import re
 
-from django.db.models import Count, DecimalField, IntegerField, OuterRef, Q, Subquery, Sum
+from django.db.models import Case, Count, DecimalField, F, IntegerField, OuterRef, Q, Subquery, Sum, Value, When
 from django.db.models.functions import Coalesce, Lower
 from django.http import FileResponse
 from django.utils import timezone
@@ -18,7 +18,7 @@ from rest_framework.response import Response
 
 from .levels import FLOWER_AMOUNT, LEVEL_JOININGS, SIGNUP_BONUS, cycle_status, level_for_joinings, next_level_target, task_rate
 from .models import (
-    Channel, ContactAdmin, Deposit, DisplayBloom, Gateway, Plan, Reward, SiteSetting,
+    Channel, ContactAdmin, Deposit, DepositEditHistory, DisplayBloom, Gateway, Plan, Reward, SiteSetting,
     Task, TaskClaim, TaskDone, Transaction, UpgradeRequest, User, Withdrawal,
 )
 
@@ -283,11 +283,18 @@ def approved_joinings(user):
     return user.team.filter(plan__isnull=False, account_status="approved")
 
 
+def level_thresholds():
+    thresholds = dict(LEVEL_JOININGS)
+    for reward in Reward.objects.filter(level__gte=1, level__lte=10, required_team__gt=0):
+        thresholds[reward.level] = reward.required_team
+    return thresholds
+
+
 def sync_level(user):
     if not user or getattr(user, "role", "") != "user":
         return 0
     count = approved_joinings(user).count()
-    level = level_for_joinings(count)
+    level = level_for_joinings(count, level_thresholds())
     if user.level != level:
         user.level = level
         user.save(update_fields=["level"])
@@ -315,7 +322,8 @@ def joining_clock(user, count):
 
 def progress_payload(user, count):
     clock = joining_clock(user, count)
-    next_level, required = next_level_target(user.level)
+    thresholds = level_thresholds()
+    next_level, required = next_level_target(user.level, thresholds)
     if not user.plan_id:
         locked = True
         message = "Tasks are locked until your package payment is approved."
@@ -447,7 +455,9 @@ def official_channels():
             "id": channel.id,
             "title": channel.title,
             "purpose": channel.purpose,
+            "description": channel.description,
             "link": channel.link,
+            "image": media_url(channel.image),
         })
     return rows
 
@@ -569,6 +579,24 @@ TASK_CATALOG = [
     ("Lavender", "Open the lavender and collect this flower's earning."),
     ("Peony", "Open the peony and collect this flower's earning."),
     ("Iris", "Open the iris and collect this flower's earning."),
+    ("Anemone", "Open the anemone and collect this flower's earning."),
+    ("Aster", "Open the aster and collect this flower's earning."),
+    ("Buttercup", "Open the buttercup and collect this flower's earning."),
+    ("Cosmos", "Open the cosmos and collect this flower's earning."),
+    ("Foxglove", "Open the foxglove and collect this flower's earning."),
+    ("Geranium", "Open the geranium and collect this flower's earning."),
+    ("Hollyhock", "Open the hollyhock and collect this flower's earning."),
+    ("Hydrangea", "Open the hydrangea and collect this flower's earning."),
+    ("Larkspur", "Open the larkspur and collect this flower's earning."),
+    ("Morning Glory", "Open the morning glory and collect this flower's earning."),
+    ("Petunia", "Open the petunia and collect this flower's earning."),
+    ("Phlox", "Open the phlox and collect this flower's earning."),
+    ("Sweet Pea", "Open the sweet pea and collect this flower's earning."),
+    ("Yarrow", "Open the yarrow and collect this flower's earning."),
+    ("Calendula", "Open the calendula and collect this flower's earning."),
+    ("Chrysanthemum", "Open the chrysanthemum and collect this flower's earning."),
+    ("Forget-Me-Not", "Open the forget-me-not and collect this flower's earning."),
+    ("Gentian", "Open the gentian and collect this flower's earning."),
 ]
 
 
@@ -810,8 +838,9 @@ def rewards(request):
         return blocked
     user = request.user
     count = sync_level(user)
+    thresholds = level_thresholds()
     items = []
-    for step, required in LEVEL_JOININGS.items():
+    for step, required in sorted(thresholds.items()):
         items.append({
             "id": step,
             "level": step,
@@ -820,7 +849,7 @@ def rewards(request):
             "prize": f"Rs {task_rate(step)} per task",
             "reached": count >= required,
         })
-    next_level, required = next_level_target(user.level)
+    next_level, required = next_level_target(user.level, thresholds)
     return Response({
         "active_team": count,
         "level": user.level,
@@ -920,7 +949,22 @@ def contacts(request):
     blocked = user_guard(request)
     if blocked:
         return blocked
-    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
+    rows = []
+    for contact in ContactAdmin.objects.all():
+        legacy_botim = contact.number_type == "botim" and not contact.botim
+        rows.append({
+            "id": contact.id,
+            "name": contact.name,
+            "role": contact.role,
+            "whatsapp": "" if legacy_botim else contact.whatsapp,
+            "botim": contact.botim or (contact.whatsapp if legacy_botim else ""),
+            "note": contact.note,
+            "purpose": contact.purpose,
+            "number_type": contact.number_type or "whatsapp",
+            "whatsapp_icon": media_url(contact.whatsapp_icon),
+            "botim_icon": media_url(contact.botim_icon),
+        })
+    return Response(rows)
 
 
 def canonical_gateway_name(name):
@@ -1763,41 +1807,45 @@ def leaderboard(request):
     if not require_admin(request):
         return Response(status=403)
     level_counts = {step: 0 for step in range(1, 11)}
-    for row in User.objects.filter(role="user").values("level").annotate(total=Count("id")):
-        step = row["level"] or 0
-        if 1 <= step <= 10:
-            level_counts[step] = row["total"]
     team_count = User.objects.filter(
         referred_by=OuterRef("pk"), plan__isnull=False, account_status="approved",
     ).order_by().values("referred_by").annotate(total=Count("id")).values("total")
     paid_out = Withdrawal.objects.filter(
         user=OuterRef("pk"), status=Withdrawal.APPROVED,
     ).order_by().values("user").annotate(total=Sum("amount")).values("total")
-    users = User.objects.filter(role="user", plan__isnull=False).select_related("plan").annotate(
+    thresholds = level_thresholds()
+    level_cases = [
+        When(active_team__gte=thresholds[step], then=Value(step))
+        for step in sorted(thresholds, reverse=True)
+    ]
+    users = User.objects.filter(role="user", plan__isnull=False, account_status="approved").select_related("plan").annotate(
         active_team=Coalesce(Subquery(team_count, output_field=IntegerField()), 0),
         earning=Coalesce(Subquery(paid_out, output_field=DecimalField(max_digits=12, decimal_places=2)), Decimal("0")),
+    ).annotate(
+        eligible_level=Case(*level_cases, default=Value(0), output_field=IntegerField()),
     )
+    for row in users.values("eligible_level").annotate(total=Count("id")):
+        step = row["eligible_level"] or 0
+        if 1 <= step <= 10:
+            level_counts[step] = row["total"]
     raw_level = (request.GET.get("level") or "").strip()
     if raw_level.isdigit():
-        users = users.filter(level=int(raw_level))
+        users = users.filter(eligible_level=int(raw_level))
     raw_day = (request.GET.get("date") or "").strip()
     if raw_day:
         users = between(users, "date_joined", parse_day(raw_day))
-    raw_time = (request.GET.get("time") or "").strip()
-    if len(raw_time) >= 2 and raw_time[:2].isdigit():
-        users = users.filter(date_joined__hour=int(raw_time[:2]))
     q = (request.GET.get("q") or "").strip()
     if q:
         users = account_search(users, q)
     sort = (request.GET.get("sort") or "earnings").strip()
     if sort == "earnings_low":
-        users = users.order_by("earning", "level", "id")
+        users = users.order_by("earning", "eligible_level", "id")
     elif sort == "level_low":
-        users = users.order_by("level", "earning", "id")
+        users = users.order_by("eligible_level", "earning", "id")
     elif sort == "level":
-        users = users.order_by("-level", "-earning", "id")
+        users = users.order_by("-eligible_level", "-earning", "id")
     else:
-        users = users.order_by("-earning", "-level", "id")
+        users = users.order_by("-earning", "-eligible_level", "id")
     page, size = page_bounds(request, 30, 40)
     chunk, count, page, pages = slice_page(users, page, size)
     rows = []
@@ -1806,7 +1854,7 @@ def leaderboard(request):
             "id": user.id,
             "full_name": user.display_name(),
             "email": user.email,
-            "level": user.level,
+            "level": user.eligible_level,
             "active_team": user.active_team,
             "earnings": money(user.earning),
             "serial": (page - 1) * size + index + 1,
@@ -1861,14 +1909,16 @@ def admin_deposits(request):
     rows = [{
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
         "username": d.user.username, "code": d.user.referral_code, "phone": d.user.phone or "",
-        "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
+        "plan_id": d.plan_id, "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "sender_name": d.sender_name or "", "trx_no": d.trx_no or "",
         "status": d.status, "created_at": d.created_at.isoformat(),
         "reject_reason": d.reject_reason, "approved_at": d.approved_at.isoformat() if d.approved_at else None,
         "screenshot": slip_url("deposits", d.id, d.screenshot),
         "upliner": person_brief(d.user.referred_by),
     } for d in chunk]
-    return Response(paged(rows, count, page, pages))
+    payload = paged(rows, count, page, pages)
+    payload["plans"] = [{"id": plan.id, "name": plan.name, "price": money(plan.price)} for plan in Plan.objects.all()]
+    return Response(payload)
 
 
 @api_view(["GET"])
@@ -1892,6 +1942,7 @@ def upgrade_slip(request, pk):
 
 
 @api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def deposit_action(request, pk):
     if not require_admin(request):
         return Response(status=403)
@@ -1903,6 +1954,48 @@ def deposit_action(request, pk):
         deposit = Deposit.objects.select_for_update().select_related("user", "plan").filter(pk=pk).first()
         if not deposit:
             return Response(status=404)
+        if action == "edit":
+            if deposit.status not in (Deposit.PENDING, Deposit.REJECTED):
+                return Response({"detail": "Only pending or rejected payments can be edited."}, status=400)
+            plan_id = request.data.get("plan_id")
+            plan = Plan.objects.filter(pk=plan_id).first() if str(plan_id or "").isdigit() else None
+            if not plan:
+                return Response({"detail": "Choose a valid plan."}, status=400)
+            try:
+                amount = Decimal(str(request.data.get("amount") or "")).quantize(Decimal("0.01"))
+            except (InvalidOperation, ValueError):
+                return Response({"detail": "Enter a valid payment amount."}, status=400)
+            if not amount.is_finite() or amount <= 0 or amount > Decimal("9999999999.99"):
+                return Response({"detail": "Payment amount must be between 0.01 and 9,999,999,999.99."}, status=400)
+            screenshot = request.FILES.get("screenshot")
+            if screenshot:
+                screenshot = image_upload(screenshot)
+                if not screenshot:
+                    return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+            DepositEditHistory.objects.create(
+                deposit=deposit,
+                editor=request.user,
+                plan_name=deposit.plan.name if deposit.plan else "",
+                amount=deposit.amount,
+                method=deposit.method,
+                sender=deposit.sender,
+                sender_name=deposit.sender_name,
+                trx_no=deposit.trx_no,
+                screenshot=deposit.screenshot.name if deposit.screenshot else None,
+            )
+            deposit.plan = plan
+            deposit.amount = amount
+            deposit.method = (request.data.get("method") or "").strip()[:80]
+            deposit.sender = (request.data.get("sender") or "").strip()[:80]
+            deposit.sender_name = (request.data.get("sender_name") or "").strip()[:120]
+            deposit.trx_no = (request.data.get("trx_no") or "").strip()[:80]
+            if screenshot:
+                deposit.screenshot = screenshot
+            deposit.save(update_fields=[
+                "plan", "amount", "method", "sender", "sender_name", "trx_no",
+                "screenshot", "updated_at",
+            ])
+            return Response({"ok": True, "status": deposit.status})
         if action == "approve":
             if deposit.status == Deposit.APPROVED:
                 return Response({"detail": "This payment is already approved."}, status=400)
@@ -2033,16 +2126,28 @@ def admin_upgrades(request):
     raw_day = (request.GET.get("date") or "").strip()
     if raw_day:
         chosen = parse_day(raw_day)
+        start, end = day_window(chosen)
+        approved_date = (
+            Q(approved_at__gte=start, approved_at__lt=end)
+            | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
+            | Q(approved_at__isnull=True, updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+        )
+        rejected_date = (
+            Q(updated_at__gte=start, updated_at__lt=end)
+            | Q(updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+        )
         if status == "approved":
-            start, end = day_window(chosen)
-            rows = rows.filter(
-                Q(approved_at__gte=start, approved_at__lt=end)
-                | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
-            )
+            rows = rows.filter(approved_date)
         elif status == "rejected":
-            rows = between(rows, "updated_at", chosen)
-        else:
+            rows = rows.filter(rejected_date)
+        elif status == "pending":
             rows = between(rows, "created_at", chosen)
+        else:
+            rows = rows.filter(
+                Q(status=UpgradeRequest.PENDING, created_at__gte=start, created_at__lt=end)
+                | (Q(status=UpgradeRequest.APPROVED) & approved_date)
+                | (Q(status=UpgradeRequest.REJECTED) & rejected_date)
+            )
     rows = related_search(rows, request.GET.get("q"), extras=("sender",))
     if request.GET.get("suggest") == "1":
         seen = []
@@ -2059,6 +2164,7 @@ def admin_upgrades(request):
     chunk, count, page, pages = slice_page(rows, page, size)
     return Response(paged([{
         "id": r.id, "user_id": r.user_id, "full_name": r.user.display_name(), "email": r.user.email,
+        "to_plan_id": r.to_plan_id,
         "from_plan": r.from_plan.name if r.from_plan else "—", "to_plan": r.to_plan.name if r.to_plan else "—",
         "plan": r.to_plan.name if r.to_plan else "—", "amount": money(r.amount), "method": r.method,
         "sender": r.sender, "sender_name": r.sender_name or "", "trx_no": r.trx_no or "",
@@ -2157,7 +2263,22 @@ def admin_channels(request):
 def admin_contacts(request):
     if not require_admin(request):
         return Response(status=403)
-    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
+    rows = []
+    for contact in ContactAdmin.objects.all():
+        legacy_botim = contact.number_type == "botim" and not contact.botim
+        rows.append({
+            "id": contact.id,
+            "name": contact.name,
+            "role": contact.role,
+            "whatsapp": "" if legacy_botim else contact.whatsapp,
+            "botim": contact.botim or (contact.whatsapp if legacy_botim else ""),
+            "note": contact.note,
+            "purpose": contact.purpose,
+            "number_type": contact.number_type or "whatsapp",
+            "whatsapp_icon": media_url(contact.whatsapp_icon),
+            "botim_icon": media_url(contact.botim_icon),
+        })
+    return Response(rows)
 
 
 @api_view(["GET", "POST"])

@@ -18,19 +18,22 @@ SIGNUP_BONUS = Decimal("50.00")
 PLAN_TASKS = {"basic": 1, "gold": 2, "standard": 4, "premium": 6, "super premium": 10}
 
 
-def level_for_joinings(count):
+def level_for_joinings(count, thresholds=None):
+    thresholds = thresholds or LEVEL_JOININGS
     level = 0
-    for step in range(1, 9):
-        if count >= LEVEL_JOININGS[step]:
+    for step, required in sorted(thresholds.items()):
+        if count >= required:
             level = step
     return level
 
 
-def next_level_target(level):
-    if level >= 8:
+def next_level_target(level, thresholds=None):
+    thresholds = thresholds or LEVEL_JOININGS
+    next_levels = [step for step in thresholds if step > level]
+    if not next_levels:
         return None, None
-    step = level + 1
-    return step, LEVEL_JOININGS[step]
+    step = min(next_levels)
+    return step, thresholds[step]
 
 
 def task_rate(level):
