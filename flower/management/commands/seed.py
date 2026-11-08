@@ -51,7 +51,7 @@ class Command(BaseCommand):
             Task(title="Share your referral link", detail="Send your link to one new person.", reward=Decimal("15")),
             Task(title="Daily check-in", detail="Open Flower and confirm today's work.", reward=Decimal("10")),
         ])
-        Channel.objects.create(title="Flowers Official Channel", purpose="Trainings | Guidelines | Earning Tips", description="Updates, rules, and daily earning tips.", link="https://flowersblom.com", sort_order=1)
+        Channel.objects.create(title="Flowers Official Channel", purpose="Trainings | Guidelines | Earning Tips", description="Updates, rules, and daily earning tips.", link="https://flowerblom.com", sort_order=1)
         ContactAdmin.objects.create(name="Support Desk", role="Account help", whatsapp="923001234567", note="Payment and withdrawal questions")
         Gateway.objects.create(name="Easypaisa", account_name="Flower Earn", account_number="03001234567")
         Gateway.objects.create(name="JazzCash", account_name="Flower Earn", account_number="03007654321")

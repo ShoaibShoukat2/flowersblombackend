@@ -66,7 +66,7 @@ STATIC_URL = "static/"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-CORS_ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173", "https://flowersblom.com", "https://www.flowersblom.com"]
+CORS_ALLOWED_ORIGINS = ["http://127.0.0.1:5173", "http://localhost:5173", "https://flowerblom.com", "https://www.flowerblom.com", "http://flowerblom.com", "http://www.flowerblom.com"]
 PASSWORD_HASHERS = [
     "django.contrib.auth.hashers.BCryptSHA256PasswordHasher",
     "django.contrib.auth.hashers.BCryptPasswordHasher",

@@ -2,12 +2,13 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework.test import APIClient
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 
-from flower.models import Deposit, Plan, Transaction, User, Withdrawal
+from flower.models import Deposit, DepositEditHistory, Plan, Transaction, UpgradeRequest, User, Withdrawal
 
 
 def stamp(model, pk, **fields):
@@ -82,6 +83,8 @@ class DashboardMathTests(TestCase):
         add_old = Transaction.objects.create(user=person, amount=Decimal("25.00"), trx_type="+", title="Balance added", remark="balance_add")
         sub_today = Transaction.objects.create(user=person, amount=Decimal("10.00"), trx_type="-", title="Balance subtracted", remark="balance_subtract")
         referral_today = Transaction.objects.create(user=person, amount=Decimal("7.00"), trx_type="+", title="Direct Referral Commission", remark="referral", level=1)
+        Transaction.objects.create(user=person, amount=Decimal("50.00"), trx_type="+", title="Bonus", remark="signup_bonus", plan_name="Account creation bonus")
+        Transaction.objects.create(user=person, amount=Decimal("200.00"), trx_type="+", title="Upgrade Referral Commission", remark="upgrade_referral", level=1, source_email="friend@flower.test")
         stamp(Transaction, old_task.pk, created_at=self.now - timedelta(days=2))
         stamp(Transaction, add_old.pk, created_at=self.now - timedelta(days=2))
         stamp(Transaction, restore.pk, created_at=self.now)
@@ -109,6 +112,18 @@ class DashboardMathTests(TestCase):
             self.assertEqual(everything["total"], overall, category)
             self.assertTrue(all(row["remark"] != "flower" for row in today["rows"]))
             self.assertTrue(all(row["remark"] != "restore20" for row in everything["rows"]))
+        upgrade_rows = self.client.get("/api/admin/transactions?category=upgrade_referral").json()
+        self.assertEqual(upgrade_rows["total"], "200.00")
+        self.assertTrue(all(row["remark"] == "upgrade_referral" for row in upgrade_rows["rows"]))
+        manual_rows = self.client.get("/api/admin/transactions?category=manual_add").json()["rows"]
+        self.assertTrue(all(row["remark"] == "balance_add" for row in manual_rows))
+        person.account_status = "approved"
+        person.save(update_fields=["account_status"])
+        user_client = APIClient()
+        user_client.force_authenticate(user=person)
+        visible = user_client.get("/api/user/transactions").json()
+        self.assertTrue(all(row["remark"] not in ("balance_sub", "balance_subtract") for row in visible))
+        self.assertEqual(user_client.get("/api/user/transactions?filter=upgrade_referral").json()[0]["amount"], "200.00")
 
         paid = Withdrawal.objects.create(
             user=person, amount=Decimal("80.00"), method="JazzCash", account="03005555555", status=Withdrawal.PENDING,
@@ -204,7 +219,7 @@ class DashboardMathTests(TestCase):
 
         plan = Plan.objects.create(name="Shown", price=Decimal("700.00"), daily_tasks=1)
         slip = SimpleUploadedFile("slip.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, content_type="image/png")
-        created = user_client.post("/api/user/deposits", {"plan_id": plan.id, "sender": "03005555555", "method": "JazzCash", "gateway_id": first[0]["id"], "screenshot": slip}, format="multipart")
+        created = user_client.post("/api/user/deposits", {"plan_id": plan.id, "sender": "03005555555", "sender_name": "Aisha Khan", "method": "JazzCash", "gateway_id": first[0]["id"], "screenshot": slip}, format="multipart")
         self.assertEqual(created.status_code, 200, created.content)
         saved = Deposit.objects.get(user=payer)
         self.assertEqual(saved.method, "JazzCash · 03001111111")
@@ -222,10 +237,172 @@ class DashboardMathTests(TestCase):
         payer = self.user("chooser")
         user_client = APIClient()
         user_client.force_authenticate(user=payer)
-        self.assertEqual(user_client.get("/api/user/withdrawals").json()["methods"], ["JazzCash", "NayaPay"])
+        self.assertEqual(user_client.get("/api/user/withdrawals").json()["methods"], ["JazzCash"])
+        self.assertEqual(user_client.get("/api/user/withdrawals").json()["other_wallets"], ["UPaisa", "SadaPay", "NayaPay"])
         self.client.post("/api/admin/gateways", {"name": "Upaisa", "account_name": "", "account_number": "", "active": "1"}, format="multipart")
-        self.assertEqual(user_client.get("/api/user/withdrawals").json()["methods"], ["JazzCash", "NayaPay", "Upaisa"])
+        self.assertEqual(user_client.get("/api/user/withdrawals").json()["methods"], ["JazzCash"])
         deposit_numbers = [row["account_number"] for row in user_client.get("/api/user/plans").json()["gateways"]]
         self.assertNotIn("", deposit_numbers)
         shown = user_client.get("/api/user/plans").json()["gateways"]
         self.assertEqual([row["account_number"] for row in shown], ["03001111111", "03002222222", "03008887777"])
+
+    def test_profile_approved_date_uses_saved_approval(self):
+        person = self.user("dated")
+        person.account_status = "approved"
+        person.plan = self.basic
+        person.activated_at = person.date_joined
+        person.save(update_fields=["account_status", "plan", "activated_at"])
+        blank = self.client.get(f"/api/admin/users/{person.id}").json()
+        self.assertIsNone(blank["profile"]["approved_at"])
+        approved = self.now - timedelta(days=4)
+        Deposit.objects.create(
+            user=person, plan=self.basic, amount=Decimal("600.00"), method="JazzCash",
+            sender="0300999", status=Deposit.APPROVED, approved_at=approved,
+        )
+        found = self.client.get(f"/api/admin/users/{person.id}").json()
+        parsed = parse_datetime(found["profile"]["approved_at"])
+        self.assertIsNotNone(parsed)
+        self.assertAlmostEqual(parsed.timestamp(), approved.timestamp(), delta=2)
+        self.assertNotEqual(int(parsed.timestamp()), int(person.date_joined.timestamp()))
+        later = self.user("laterjoin")
+        stamp(User, later.pk, date_joined=self.now - timedelta(days=9), activated_at=self.now - timedelta(days=1), account_status="approved")
+        opened = self.client.get(f"/api/admin/users/{later.id}").json()
+        activated = parse_datetime(opened["profile"]["approved_at"])
+        self.assertIsNotNone(activated)
+        self.assertAlmostEqual(activated.timestamp(), (self.now - timedelta(days=1)).timestamp(), delta=2)
+
+    def test_leaderboard_uses_approved_team_and_approved_withdrawals_for_level_and_earnings(self):
+        person = self.user("leader")
+        person.plan = self.basic
+        person.account_status = "approved"
+        person.level = 0
+        person.save(update_fields=["plan", "account_status", "level"])
+        for index in range(3):
+            member = self.user(f"leaderteam{index}")
+            member.plan = self.basic
+            member.account_status = "approved"
+            member.referred_by = person
+            member.save(update_fields=["plan", "account_status", "referred_by"])
+        pending = self.user("leaderpending")
+        pending.plan = self.basic
+        pending.account_status = "pending"
+        pending.referred_by = person
+        pending.save(update_fields=["plan", "account_status", "referred_by"])
+        Withdrawal.objects.create(user=person, amount=Decimal("125.00"), method="JazzCash", account="03001111111", status=Withdrawal.APPROVED)
+        Withdrawal.objects.create(user=person, amount=Decimal("700.00"), method="JazzCash", account="03001111111", status=Withdrawal.PENDING)
+        Withdrawal.objects.create(user=person, amount=Decimal("900.00"), method="JazzCash", account="03001111111", status=Withdrawal.REJECTED)
+
+        response = self.client.get("/api/admin/leaderboard?level=1")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        row = next(item for item in payload["rows"] if item["id"] == person.id)
+        self.assertEqual(row["level"], 1)
+        self.assertEqual(row["active_team"], 3)
+        self.assertEqual(row["earnings"], "125.00")
+        self.assertEqual(next(item["count"] for item in payload["levels"] if item["level"] == 1), 1)
+
+    def test_upgrade_board_counts_and_receives_only_selected_date_approvals(self):
+        current = self.user("upgradecurrent")
+        previous = self.user("upgradeprevious")
+        now = timezone.now()
+        selected_day = timezone.localdate(now).isoformat()
+        approved = UpgradeRequest.objects.create(
+            user=current, from_plan=self.basic, to_plan=self.gold,
+            amount=Decimal("4400.00"), status=UpgradeRequest.APPROVED, approved_at=now,
+        )
+        pending = UpgradeRequest.objects.create(
+            user=current, from_plan=self.basic, to_plan=self.gold,
+            amount=Decimal("4400.00"), status=UpgradeRequest.PENDING,
+        )
+        rejected = UpgradeRequest.objects.create(
+            user=current, from_plan=self.basic, to_plan=self.gold,
+            amount=Decimal("4400.00"), status=UpgradeRequest.REJECTED,
+        )
+        older = UpgradeRequest.objects.create(
+            user=previous, from_plan=self.basic, to_plan=self.gold,
+            amount=Decimal("900.00"), status=UpgradeRequest.APPROVED, approved_at=now - timedelta(days=2),
+        )
+        stamp(UpgradeRequest, pending.pk, created_at=now)
+        stamp(UpgradeRequest, rejected.pk, updated_at=now)
+
+        response = self.client.get(f"/api/admin/upgrade-board?date={selected_day}")
+        payload = response.json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["today_receive"], "4400.00")
+        self.assertEqual(payload["approved"], 1)
+        self.assertEqual(payload["pending"], 1)
+        self.assertEqual(payload["rejected"], 1)
+        self.assertEqual(payload["all_approved"], 2)
+        for status, expected in (("approved", approved.pk), ("pending", pending.pk), ("rejected", rejected.pk)):
+            listed = self.client.get(f"/api/admin/upgrades?status={status}&date={selected_day}").json()["rows"]
+            self.assertEqual([item["id"] for item in listed], [expected])
+        all_rows = self.client.get(f"/api/admin/upgrades?status=all&date={selected_day}").json()["rows"]
+        self.assertEqual({item["id"] for item in all_rows}, {approved.pk, pending.pk, rejected.pk})
+        self.assertNotIn(older.pk, {item["id"] for item in all_rows})
+
+    def test_editing_rejected_payment_saves_history_and_approval_uses_final_plan(self):
+        sponsor = self.user("editedponsor")
+        person = self.user("editeduser")
+        person.referred_by = sponsor
+        person.save(update_fields=["referred_by"])
+        deposit = Deposit.objects.create(
+            user=person, plan=self.basic, amount=Decimal("600.00"),
+            method="Old method", sender="03000000000", sender_name="Old name",
+            status=Deposit.REJECTED, reject_reason="Wrong plan",
+        )
+
+        edited = self.client.post(f"/api/admin/deposits/{deposit.id}", {
+            "action": "edit",
+            "plan_id": str(self.gold.id),
+            "amount": "560.00",
+            "method": "JazzCash",
+            "sender": "03005556666",
+            "sender_name": "Final Sender",
+            "trx_no": "FINAL-1",
+        }, format="multipart")
+
+        self.assertEqual(edited.status_code, 200)
+        history = DepositEditHistory.objects.get(deposit=deposit)
+        self.assertEqual(history.plan_name, self.basic.name)
+        self.assertEqual(history.amount, Decimal("600.00"))
+        self.assertEqual(history.sender, "03000000000")
+
+        approved = self.client.post(f"/api/admin/deposits/{deposit.id}", {"action": "approve"}, format="json")
+        self.assertEqual(approved.status_code, 200)
+        person.refresh_from_db()
+        sponsor.refresh_from_db()
+        deposit.refresh_from_db()
+        self.assertEqual(person.plan_id, self.gold.id)
+        self.assertEqual(person.account_status, "approved")
+        self.assertEqual(deposit.plan_id, self.gold.id)
+        self.assertEqual(deposit.amount, Decimal("560.00"))
+        self.assertEqual(sponsor.balance, Decimal("140.00"))
+        self.assertEqual(Transaction.objects.filter(user=sponsor, remark="referral", source_email=person.email).count(), 1)
+        duplicate = self.client.post(f"/api/admin/deposits/{deposit.id}", {"action": "approve"}, format="json")
+        self.assertEqual(duplicate.status_code, 400)
+        self.assertEqual(Transaction.objects.filter(user=sponsor, remark="referral", source_email=person.email).count(), 1)
+
+    def test_contact_settings_keep_both_direct_chat_numbers(self):
+        response = self.client.post("/api/admin/contacts/save", {
+            "name": "Support Leader",
+            "purpose": "Payment support",
+            "instructions": "Message with your account email.",
+            "whatsapp": "+923001112222",
+            "botim": "+923003334444",
+        }, format="multipart")
+
+        self.assertEqual(response.status_code, 200)
+        admin_row = self.client.get("/api/admin/contacts").json()[0]
+        self.assertEqual(admin_row["whatsapp"], "+923001112222")
+        self.assertEqual(admin_row["botim"], "+923003334444")
+        self.assertEqual(admin_row["purpose"], "Payment support")
+        self.assertEqual(admin_row["note"], "Message with your account email.")
+
+        person = self.user("contactviewer")
+        user_client = APIClient()
+        user_client.force_authenticate(user=person)
+        user_row = user_client.get("/api/user/contacts").json()[0]
+        self.assertEqual(user_row["whatsapp"], "+923001112222")
+        self.assertEqual(user_row["botim"], "+923003334444")

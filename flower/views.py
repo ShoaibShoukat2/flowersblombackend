@@ -4,8 +4,10 @@ from uuid import uuid4
 
 from django.core.cache import cache
 from django.db import IntegrityError, transaction
-from django.db.models import Count, Q, Sum
-from django.db.models.functions import Lower
+import re
+
+from django.db.models import Case, Count, DecimalField, F, IntegerField, OuterRef, Q, Subquery, Sum, Value, When
+from django.db.models.functions import Coalesce, Lower
 from django.http import FileResponse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
@@ -14,13 +16,18 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .levels import FLOWER_AMOUNT, LEVEL_JOININGS, cycle_status, level_for_joinings, next_level_target, task_rate
+from .levels import FLOWER_AMOUNT, LEVEL_JOININGS, SIGNUP_BONUS, cycle_status, level_for_joinings, next_level_target, task_rate
 from .models import (
-    Channel, ContactAdmin, Deposit, Gateway, Plan, Reward, SiteSetting,
+    Channel, ContactAdmin, Deposit, DepositEditHistory, DisplayBloom, Gateway, Plan, Reward, SiteSetting,
     Task, TaskClaim, TaskDone, Transaction, UpgradeRequest, User, Withdrawal,
 )
 
 LOGO = "/logo.png"
+EMAIL_RE = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
+
+
+def valid_email(value):
+    return bool(EMAIL_RE.match((value or "").strip()))
 
 
 def money(value):
@@ -44,15 +51,49 @@ def client_ip(request):
     return forwarded or request.META.get("REMOTE_ADDR") or "unknown"
 
 
-def too_many(bucket, limit, seconds):
+def guard_row(bucket):
     key = f"guard:{bucket}"
+    now = timezone.now().timestamp()
     try:
-        count = cache.get(key, 0) or 0
-        if count >= limit:
+        row = cache.get(key)
+    except Exception:
+        return now, None, key
+    if not isinstance(row, dict) or row.get("until", 0) <= now:
+        return now, None, key
+    return now, row, key
+
+
+def guard_blocked(bucket, limit):
+    _now, row, _key = guard_row(bucket)
+    return bool(row and row.get("count", 0) >= limit)
+
+
+def guard_fail(bucket, limit, seconds):
+    now, row, key = guard_row(bucket)
+    try:
+        if row is None:
+            cache.set(key, {"count": 1, "until": now + seconds}, seconds)
+            return 1 >= limit
+        if row.get("count", 0) >= limit:
             return True
-        cache.set(key, count + 1, seconds)
+        row["count"] = int(row.get("count", 0)) + 1
+        cache.set(key, row, max(1, int(row["until"] - now)))
+        return row["count"] >= limit
     except Exception:
         return False
+
+
+def guard_clear(bucket):
+    try:
+        cache.delete(f"guard:{bucket}")
+    except Exception:
+        return
+
+
+def too_many(bucket, limit, seconds):
+    if guard_blocked(bucket, limit):
+        return True
+    guard_fail(bucket, limit, seconds)
     return False
 
 
@@ -104,6 +145,7 @@ def user_payload(user, request=None):
         "level": user.level,
         "plan": user.plan.name if user.plan else None,
         "plan_id": user.plan_id,
+        "plan_price": money(user.plan.price) if user.plan_id else "0.00",
         "logo": LOGO,
     }
 
@@ -149,14 +191,21 @@ def tx_public(tx, include_email=False):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login(request):
-    if too_many(f"login:{client_ip(request)}", 10, 600):
-        return Response({"detail": "Too many sign-in attempts. Wait a few minutes and try again."}, status=429)
     ident = (request.data.get("identity") or "").strip()
     password = request.data.get("password") or ""
     role = request.data.get("role") or "user"
+    ip = client_ip(request)
+    ip_key = f"signin-ip:{ip}"
+    ident_key = f"signin:{ip}:{ident.lower()}"
+    if guard_blocked(ip_key, 40) or (ident and guard_blocked(ident_key, 12)):
+        return Response({"detail": "Too many sign-in attempts. Please wait 15 minutes and try again."}, status=429)
     user = User.objects.filter(email__iexact=ident).first() or User.objects.filter(username__iexact=ident).first() or User.objects.filter(phone=ident).first()
     if not user or not user.check_password(password) or user.role != role:
+        guard_fail(ip_key, 40, 900)
+        if ident:
+            guard_fail(ident_key, 12, 900)
         return Response({"detail": "Email, username, or password is incorrect."}, status=400)
+    guard_clear(ident_key)
     if user.account_status == "banned" or user.banned_at:
         return Response({"detail": "Your Account Is Banned", "reason": user.ban_reason or ""}, status=403)
     token, _ = Token.objects.get_or_create(user=user)
@@ -179,9 +228,13 @@ def register(request):
     code = (request.data.get("referral") or "").strip()
     if not full_name or not email or len(password) < 6:
         return Response({"detail": "Name, email, and a password of at least 6 characters are required."}, status=400)
+    if not valid_email(email):
+        return Response({"detail": "Enter a valid email address, for example name@gmail.com."}, status=400)
     if User.objects.filter(email__iexact=email).exists():
         return Response({"detail": "This email is already registered."}, status=400)
     parent = User.objects.filter(referral_code__iexact=code, role="user").first() if code else None
+    if not parent:
+        return Response({"detail": "A valid referral code is required."}, status=400)
     import secrets
     username = "X" + secrets.token_hex(2).upper()
     while User.objects.filter(username=username).exists():
@@ -192,6 +245,16 @@ def register(request):
     user.save()
     token, _ = Token.objects.get_or_create(user=user)
     return Response({"token": token.key, "user": user_payload(user)})
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def referrer(request):
+    code = (request.GET.get("code") or "").strip()
+    parent = User.objects.filter(referral_code__iexact=code, role="user").first() if code else None
+    if not parent:
+        return Response({"detail": "Referral code not found."}, status=404)
+    return Response({"name": parent.display_name(), "code": parent.referral_code})
 
 
 @api_view(["GET"])
@@ -231,20 +294,10 @@ def sync_level(user):
     return count
 
 
-def credit_flower_once(user):
-    if user.flower_credited:
-        return
-    user.flower_balance += FLOWER_AMOUNT
-    user.flower_credited = True
-    user.save(update_fields=["flower_balance", "flower_credited"])
-    Transaction.objects.create(user=user, amount=FLOWER_AMOUNT, trx_type="+", title="Flower Earning", remark="flower")
-
-
 def activate_member(user):
     if user.activated_at is None:
         user.activated_at = timezone.now()
         user.save(update_fields=["activated_at"])
-    credit_flower_once(user)
     sync_level(user)
     if user.referred_by_id:
         sync_level(user.referred_by)
@@ -271,7 +324,10 @@ def progress_payload(user, count):
         message = f"Tasks are locked because no approved joining arrived in the last {clock['days']} days. When a new member's payment is approved, tasks unlock and the next cycle starts."
     else:
         locked = False
-        message = f"Tasks are unlocked. Complete an approved joining within {clock['days']} days to keep them open."
+        if clock.get("kept_open"):
+            message = "Tasks are unlocked. An approved joining is on your team, so tasks stay open until you reach Level 1."
+        else:
+            message = f"Tasks are unlocked. Complete an approved joining within {clock['days']} days to keep them open."
     return {
         "level": user.level,
         "joinings": count,
@@ -343,9 +399,121 @@ def growth_percent(current, previous):
     return int(((current - previous) / previous * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
+def user_guard(request):
+    blocked = banned_response(request.user)
+    if blocked:
+        return blocked
+    if getattr(request.user, "account_status", "") != "approved":
+        return Response({"detail": "Your account is waiting for admin approval.", "hold": True}, status=403)
+    return None
+
+
+def submitted_payment(user):
+    return user.deposits.filter(status=Deposit.PENDING).exclude(screenshot="").exists()
+
+
+def latest_reject_reason(user):
+    row = user.deposits.filter(status=Deposit.REJECTED).order_by("-updated_at", "-id").first()
+    return (row.reject_reason if row else "") or ""
+
+
+def account_phase(user):
+    if user.account_status == "banned" or user.banned_at:
+        return "banned"
+    if user.account_status == "approved":
+        if not user.channels_confirmed_at:
+            return "join_channels"
+        return "approved"
+    submitted = submitted_payment(user)
+    if user.account_status == "rejected" and not submitted:
+        return "rejected"
+    if not submitted:
+        return "choose_plan"
+    return "timer"
+
+
+def review_remaining(user):
+    deposit = user.deposits.filter(status=Deposit.PENDING).exclude(screenshot="").order_by("-id").first()
+    if not deposit:
+        return 0
+    end = deposit.created_at + timedelta(hours=4)
+    return max(0, int((end - timezone.now()).total_seconds()))
+
+
+def official_channels():
+    rows = []
+    for channel in Channel.objects.filter(status=True).order_by("sort_order", "id")[:2]:
+        rows.append({
+            "id": channel.id,
+            "title": channel.title,
+            "purpose": channel.purpose,
+            "description": channel.description,
+            "link": channel.link,
+            "image": media_url(channel.image),
+        })
+    return rows
+
+
+def gate_payload(user):
+    phase = account_phase(user)
+    remaining = review_remaining(user) if phase == "timer" else 0
+    show_channels = phase == "join_channels"
+    return {
+        "phase": phase,
+        "account_status": user.account_status,
+        "reject_reason": user.ban_reason or "" if phase == "banned" else latest_reject_reason(user),
+        "reason": user.ban_reason or "" if phase == "banned" else "",
+        "channels": official_channels() if show_channels else [],
+        "confirmed": bool(user.channels_confirmed_at),
+        "remaining_seconds": remaining,
+        "timer_complete": phase == "timer" and remaining == 0,
+    }
+
+
+@api_view(["GET"])
+def account_gate(request):
+    user = request.user
+    if user.account_status == "banned" or user.banned_at:
+        return Response(gate_payload(user))
+    return Response(gate_payload(user))
+
+
+@api_view(["POST"])
+def confirm_channels(request):
+    blocked = banned_response(request.user)
+    if blocked:
+        return blocked
+    if not request.data.get("joined"):
+        return Response({"detail": "Confirm that you joined both official channels."}, status=400)
+    with transaction.atomic():
+        user = User.objects.select_for_update().get(pk=request.user.pk)
+        if user.account_status != "approved":
+            return Response({"detail": "Official channels open after an admin approves your account."}, status=400)
+        if user.channels_confirmed_at is None:
+            user.channels_confirmed_at = timezone.now()
+            user.save(update_fields=["channels_confirmed_at"])
+    user.refresh_from_db()
+    return Response(gate_payload(user))
+
+
+@api_view(["POST"])
+def confirm_daily_channels(request):
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
+    if not request.data.get("joined"):
+        return Response({"detail": "Confirm that you joined both official channels."}, status=400)
+    user = request.user
+    if not user.channels_confirmed_at:
+        return Response({"detail": "Join the official channels after approval before opening the task room."}, status=400)
+    user.channels_day = timezone.localdate()
+    user.save(update_fields=["channels_day"])
+    return Response({"ok": True, "channels_due": False})
+
+
 @api_view(["GET"])
 def user_home(request):
-    blocked = banned_response(request.user)
+    blocked = user_guard(request)
     if blocked:
         return blocked
     user = request.user
@@ -406,15 +574,41 @@ TASK_CATALOG = [
 ]
 
 
+DISPLAY_FLOWERS = [
+    ("Camellia", "hibiscus", "#e11d48"), ("Bluebell", "tulip", "#60a5fa"), ("Daffodil", "sun", "#f5b301"),
+    ("Gardenia", "white", "#fff7fb"), ("Hibiscus", "hibiscus", "#ff4f9a"), ("Magnolia", "white", "#fde68a"),
+    ("Poppy", "tulip", "#ef4444"), ("Violet", "hibiscus", "#a78bfa"), ("Zinnia", "sun", "#fb7185"),
+    ("Azalea", "white", "#fda4af"), ("Begonia", "hibiscus", "#f43f5e"), ("Carnation", "tulip", "#fb7185"),
+    ("Dahlia", "sun", "#f97316"), ("Freesia", "white", "#fef3c7"), ("Gerbera", "hibiscus", "#ec4899"),
+    ("Heather", "tulip", "#c084fc"), ("Ixora", "sun", "#f59e0b"), ("Jonquil", "white", "#fff1f2"),
+    ("Kalmia", "hibiscus", "#db2777"), ("Lilac", "tulip", "#d946ef"), ("Mimosa", "sun", "#facc15"),
+    ("Narcissus", "white", "#ffe4e6"), ("Oleander", "hibiscus", "#be185d"), ("Primrose", "tulip", "#f9a8d4"),
+    ("Quince", "sun", "#fdba74"), ("Ranunculus", "white", "#ffffff"), ("Snapdragon", "hibiscus", "#e879f9"),
+    ("Tuberose", "tulip", "#86efac"), ("Verbena", "sun", "#fb923c"), ("Wisteria", "hibiscus", "#818cf8"),
+]
+
+
 def ensure_task_catalog():
     for title, detail in TASK_CATALOG:
-        task, created = Task.objects.get_or_create(title=title, defaults={"detail": detail, "reward": 0, "active": True})
-        if not created and (task.detail != detail or not task.active):
+        task, created = Task.objects.get_or_create(title=title, defaults={"detail": detail, "reward": 0, "active": True, "display_only": False})
+        if not created and not task.display_only and (task.detail != detail or not task.active):
             task.detail = detail
             task.active = True
             task.save(update_fields=["detail", "active"])
     Task.objects.filter(title="Daily task").update(active=False)
-    return list(Task.objects.filter(active=True).order_by("id"))
+    return list(Task.objects.filter(active=True, display_only=False).order_by("id"))
+
+
+def ensure_display_flowers():
+    rows = []
+    for title, kind, tone in DISPLAY_FLOWERS:
+        task, created = Task.objects.get_or_create(
+            title=title,
+            defaults={"detail": "A garden flower you can bloom. It does not pay a reward.", "reward": 0, "active": True, "display_only": True},
+        )
+        if created or task.display_only:
+            rows.append((task, kind, tone))
+    return rows
 
 
 def today_tasks(limit):
@@ -440,6 +634,9 @@ def today_tasks(limit):
 
 @api_view(["GET"])
 def tasks(request):
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
     user = request.user
     count = sync_level(user)
     progress = progress_payload(user, count)
@@ -458,18 +655,52 @@ def tasks(request):
             "detail": task.detail,
             "reward": rate,
             "done": limit_full or task.id in opened,
+            "display_only": False,
         })
-    return Response({"tasks": rows, "done_today": done_today, "progress": progress})
+    channels_due = user.channels_day != timezone.localdate()
+    bloomed = set(DisplayBloom.objects.filter(user=user, day=timezone.localdate()).values_list("task_id", flat=True))
+    extras = []
+    for offset, (task, kind, tone) in enumerate(ensure_display_flowers()):
+        extras.append({
+            "id": task.id,
+            "slot": 100 + offset,
+            "title": task.title,
+            "detail": task.detail,
+            "reward": "0.00",
+            "done": task.id in bloomed,
+            "display_only": True,
+            "kind": kind,
+            "tone": tone,
+        })
+    return Response({
+        "tasks": rows,
+        "extras": extras,
+        "done_today": done_today,
+        "progress": progress,
+        "channels_due": channels_due,
+        "channels": official_channels() if channels_due else [],
+    })
 
 
 @api_view(["POST"])
 def complete_task(request, pk):
-    blocked = banned_response(request.user)
+    blocked = user_guard(request)
     if blocked:
         return blocked
     task = Task.objects.filter(pk=pk, active=True).first()
     if not task:
         return Response({"detail": "Task not found."}, status=404)
+    if task.display_only:
+        DisplayBloom.objects.get_or_create(user=request.user, task=task, day=timezone.localdate())
+        return Response({
+            "balance": money(request.user.balance),
+            "reward": "0.00",
+            "flower": "0.00",
+            "bonus": "0.00",
+            "display_only": True,
+        })
+    reward = Decimal("0")
+    bonus = Decimal("0")
     try:
         with transaction.atomic():
             user = User.objects.select_for_update().get(pk=request.user.pk)
@@ -490,18 +721,51 @@ def complete_task(request, pk):
             reward = task_rate(user.level)
             TaskDone.objects.create(user=user, task=task)
             user.balance += reward
-            user.save(update_fields=["balance"])
+            user.flower_balance += FLOWER_AMOUNT
+            bonus = Decimal("0")
+            first_task = TaskDone.objects.filter(user=user).count() == 1
+            already_bonus = Transaction.objects.filter(user=user, remark="signup_bonus").exists()
+            if first_task and not already_bonus:
+                bonus = SIGNUP_BONUS
+                user.balance += bonus
+            user.save(update_fields=["balance", "flower_balance"])
             Transaction.objects.create(user=user, amount=reward, trx_type="+", title="Task Earning", remark="ads", plan_name=user.plan.name if user.plan else "")
+            Transaction.objects.create(user=user, amount=FLOWER_AMOUNT, trx_type="+", title="Flower Earning", remark="flower", plan_name=task.title)
+            if bonus:
+                Transaction.objects.create(
+                    user=user, amount=bonus, trx_type="+", title="Bonus", remark="signup_bonus",
+                    plan_name="Account creation bonus",
+                )
     except IntegrityError:
         return Response({"detail": "This flower is already open today."}, status=400)
-    return Response({"balance": money(user.balance), "reward": money(reward)})
+    return Response({
+        "balance": money(user.balance),
+        "reward": money(reward),
+        "flower": money(FLOWER_AMOUNT),
+        "bonus": money(bonus),
+        "display_only": False,
+    })
+
+
+def tx_for_user(tx):
+    data = tx_public(tx, include_email=tx.level == 1)
+    if tx.remark in ("balance_add", "signup_bonus"):
+        data["title"] = "Bonus"
+        data["plan_name"] = ""
+        data.pop("source_email", None)
+    return data
 
 
 @api_view(["GET"])
 def transactions(request):
-    qs = request.user.transactions.all()
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
+    qs = request.user.transactions.exclude(remark__in=["flower", "flower_add", "flower_sub", "balance_sub", "balance_subtract"])
     kind = request.GET.get("filter") or ""
-    if kind == "ads":
+    if kind in ("balance_sub", "balance_subtract", "manual_sub"):
+        qs = qs.none()
+    elif kind == "ads":
         qs = qs.filter(remark="ads")
     elif kind == "direct":
         qs = qs.filter(remark="referral", level=1)
@@ -511,13 +775,20 @@ def transactions(request):
         qs = qs.filter(remark="referral", level=3)
     elif kind == "indirect":
         qs = qs.filter(remark="referral", level__in=[2, 3])
+    elif kind in ("upgrade_referral", "plan_upgrade_referral"):
+        qs = qs.filter(remark="upgrade_referral", trx_type="+")
     elif kind == "withdraw":
         qs = qs.filter(remark="withdraw")
-    return Response([tx_public(tx, include_email=tx.level == 1) for tx in qs[:100]])
+    elif kind == "bonus":
+        qs = qs.filter(remark__in=["balance_add", "signup_bonus"], trx_type="+")
+    return Response([tx_for_user(tx) for tx in qs[:100]])
 
 
 @api_view(["GET"])
 def team(request):
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
     rows = []
     for member in request.user.team.select_related("plan").order_by("-id"):
         if not member.plan_id or member.account_status != "approved":
@@ -536,6 +807,9 @@ def team(request):
 
 @api_view(["GET"])
 def rewards(request):
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
     user = request.user
     count = sync_level(user)
     items = []
@@ -592,7 +866,7 @@ def withdrawal_rule(user):
 
 @api_view(["GET", "POST"])
 def withdrawals(request):
-    blocked = banned_response(request.user)
+    blocked = user_guard(request)
     if blocked:
         return blocked
     if request.method == "POST":
@@ -605,9 +879,9 @@ def withdrawals(request):
         account = (request.data.get("account") or "").strip()
         if amount <= 0 or not method or not account_name or not account:
             return Response({"detail": "Enter an amount above zero, plus the method, account name, and account number."}, status=400)
-        allowed = withdrawal_methods()
-        method = canonical_gateway_name(method)
-        if method not in allowed:
+        wallet = other_wallet_label(method)
+        method = wallet or canonical_gateway_name(method)
+        if not wallet and method not in withdrawal_methods():
             return Response({"detail": "That payment method is not available."}, status=400)
         amount = amount.quantize(Decimal("0.01"))
         with transaction.atomic():
@@ -640,12 +914,26 @@ def withdrawals(request):
             "created_at": item.created_at.isoformat() if item.created_at else None,
             "approved_at": item.updated_at.isoformat() if item.status == Withdrawal.APPROVED and item.updated_at else None,
         })
-    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable), "methods": withdrawal_methods()})
+    return Response({"rows": rows, "minimum": money(minimum), "minimum_message": message, "withdrawable": money(withdrawable), "methods": withdrawal_methods(), "other_wallets": list(OTHER_WALLETS)})
 
 
 @api_view(["GET"])
 def contacts(request):
-    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
+    return Response([{
+        "id": c.id,
+        "name": c.name,
+        "role": c.role,
+        "whatsapp": c.whatsapp if c.number_type != "botim" or c.botim else "",
+        "botim": c.botim or (c.whatsapp if c.number_type == "botim" else ""),
+        "note": c.note,
+        "purpose": c.purpose,
+        "number_type": c.number_type or "whatsapp",
+        "whatsapp_icon": media_url(c.whatsapp_icon),
+        "botim_icon": media_url(c.botim_icon),
+    } for c in ContactAdmin.objects.all()])
 
 
 def canonical_gateway_name(name):
@@ -660,11 +948,26 @@ def canonical_gateway_name(name):
     return raw
 
 
+OTHER_WALLETS = ("UPaisa", "SadaPay", "NayaPay")
+
+
+def wallet_key(name):
+    return "".join((name or "").lower().split())
+
+
+def is_other_wallet(name):
+    return wallet_key(name) in {"upaisa", "sadapay", "nayapay"}
+
+
+def other_wallet_label(name):
+    return {"upaisa": "UPaisa", "sadapay": "SadaPay", "nayapay": "NayaPay"}.get(wallet_key(name), "")
+
+
 def withdrawal_methods():
     names = []
     for gateway in payment_gateways(require_number=False):
         label = canonical_gateway_name(gateway.name)
-        if label and label not in names:
+        if label and not is_other_wallet(label) and label not in names:
             names.append(label)
     return names
 
@@ -688,9 +991,17 @@ def gateway_public(gateway):
         "name": canonical_gateway_name(gateway.name),
         "account_name": gateway.account_name,
         "account_number": gateway.account_number,
+        "instructions": gateway.instructions or "",
         "image": media_url(gateway.image),
         "active": gateway.active,
     }
+
+
+def plan_upgrade_locked(user):
+    if not user or not getattr(user, "plan_id", None):
+        return False
+    sync_level(user)
+    return user.level >= 3
 
 
 @api_view(["GET"])
@@ -698,9 +1009,12 @@ def plans(request):
     user = request.user
     pending = user.deposits.filter(status=Deposit.PENDING).select_related("plan").order_by("-id").first()
     upgrade = UpgradeRequest.objects.filter(user=user, status=UpgradeRequest.PENDING).select_related("to_plan").order_by("-id").first()
+    locked = plan_upgrade_locked(user)
     return Response({
         "current_plan_id": user.plan_id,
         "current_plan": user.plan.name if user.plan else None,
+        "upgrade_locked": locked,
+        "level": user.level,
         "plans": [{"id": p.id, "name": p.name, "price": money(p.price), "daily_tasks": p.daily_tasks, "color": p.color, "text_color": p.text_color} for p in Plan.objects.all()],
         "gateways": [gateway_public(gateway) for gateway in payment_gateways()],
         "current_price": money(user.plan.price) if user.plan_id else "0.00",
@@ -719,10 +1033,16 @@ def deposit_create(request):
     if not plan:
         return Response({"detail": "Choose a plan."}, status=400)
     user = request.user
+    if user.plan_id and plan_upgrade_locked(user):
+        return Response({"detail": "Plan upgrade is locked because Level 3 is already unlocked. You can upgrade only before Level 3."}, status=400)
     sender = (request.data.get("sender") or "").strip()
+    sender_name = (request.data.get("sender_name") or "").strip()[:120]
+    trx_no = (request.data.get("trx_no") or "").strip()[:80]
     method = (request.data.get("method") or "").strip()
     if not sender or not method:
         return Response({"detail": "Choose JazzCash or Easypaisa and enter the sender number."}, status=400)
+    if not sender_name:
+        return Response({"detail": "Enter the sender name."}, status=400)
     shot = image_upload(request.FILES.get("screenshot"))
     if not shot:
         return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
@@ -757,12 +1077,14 @@ def deposit_create(request):
             waiting.amount = extra
             waiting.method = method
             waiting.sender = sender
+            waiting.sender_name = sender_name
+            waiting.trx_no = trx_no
             waiting.screenshot = shot
             waiting.save()
             return Response({"kind": "upgrade", "status": "pending"})
         UpgradeRequest.objects.create(
             user=user, from_plan=user.plan, to_plan=plan, amount=extra,
-            method=method, sender=sender, screenshot=shot,
+            method=method, sender=sender, sender_name=sender_name, trx_no=trx_no, screenshot=shot,
         )
         return Response({"kind": "upgrade", "status": "pending"})
     pending = user.deposits.filter(status=Deposit.PENDING).order_by("-id").first()
@@ -773,12 +1095,14 @@ def deposit_create(request):
         pending.amount = plan.price
         pending.method = method
         pending.sender = sender
+        pending.sender_name = sender_name
+        pending.trx_no = trx_no
         pending.screenshot = shot
         pending.save()
         return Response({"id": pending.id, "kind": "deposit", "status": pending.status})
     deposit = Deposit.objects.create(
         user=user, plan=plan, amount=plan.price, method=method, sender=sender,
-        screenshot=shot, status=Deposit.PENDING,
+        sender_name=sender_name, trx_no=trx_no, screenshot=shot, status=Deposit.PENDING,
     )
     if user.account_status != "approved":
         user.account_status = "pending"
@@ -789,6 +1113,11 @@ def deposit_create(request):
 @api_view(["POST"])
 @parser_classes([MultiPartParser, FormParser, JSONParser])
 def upgrade_create(request):
+    blocked = user_guard(request)
+    if blocked:
+        return blocked
+    if plan_upgrade_locked(request.user):
+        return Response({"detail": "Plan upgrade is locked because Level 3 is already unlocked. You can upgrade only before Level 3."}, status=400)
     plan_id = request.data.get("plan_id")
     if not str(plan_id or "").isdigit():
         return Response({"detail": "Choose a plan."}, status=400)
@@ -806,6 +1135,8 @@ def upgrade_create(request):
         user=request.user, from_plan=request.user.plan, to_plan=plan, amount=extra,
         method=(request.data.get("method") or "").strip(),
         sender=(request.data.get("sender") or "").strip(),
+        sender_name=(request.data.get("sender_name") or "").strip()[:120],
+        trx_no=(request.data.get("trx_no") or "").strip()[:80],
         screenshot=shot,
     )
     return Response({"ok": True})
@@ -1109,6 +1440,22 @@ def source_ids(emails):
     return {mail: pk for mail, pk in found}
 
 
+def payment_shots(user_ids):
+    best = {}
+    ids = [pk for pk in user_ids if pk]
+    if not ids:
+        return best
+    for row in Deposit.objects.filter(user_id__in=ids).exclude(screenshot="").only("id", "user_id", "screenshot", "created_at"):
+        prev = best.get(row.user_id)
+        if not prev or (row.created_at and row.created_at >= prev[0]):
+            best[row.user_id] = (row.created_at, slip_url("deposits", row.id, row.screenshot))
+    for row in UpgradeRequest.objects.filter(user_id__in=ids).exclude(screenshot="").only("id", "user_id", "screenshot", "created_at"):
+        prev = best.get(row.user_id)
+        if not prev or (row.created_at and row.created_at >= prev[0]):
+            best[row.user_id] = (row.created_at, slip_url("upgrades", row.id, row.screenshot))
+    return {key: value[1] for key, value in best.items()}
+
+
 def team_card(user):
     return {
         "id": user.id,
@@ -1190,10 +1537,29 @@ def deposit_slip_row(deposit):
         "amount": money(deposit.amount),
         "method": deposit.method,
         "sender": deposit.sender,
+        "sender_name": deposit.sender_name or "",
+        "trx_no": deposit.trx_no or "",
         "status": deposit.status,
+        "reject_reason": deposit.reject_reason or "",
         "created_at": deposit.created_at.isoformat(),
         "screenshot": slip_url("deposits", deposit.id, deposit.screenshot),
     }
+
+
+def account_approved_stamp(user):
+    stamp = (
+        user.deposits.filter(status=Deposit.APPROVED)
+        .exclude(approved_at__isnull=True)
+        .order_by("approved_at")
+        .values_list("approved_at", flat=True)
+        .first()
+    )
+    if stamp:
+        return stamp
+    joined = user.date_joined
+    if user.activated_at and joined and user.activated_at > joined:
+        return user.activated_at
+    return None
 
 
 @api_view(["GET"])
@@ -1204,11 +1570,16 @@ def admin_user_detail(request, pk):
     if not user:
         return Response(status=404)
     team_qs = user.team.select_related("plan")
-    paid_team = team_qs.filter(plan__isnull=False).count()
+    paid_team = team_qs.filter(plan__isnull=False).exclude(account_status="banned").count()
     unpaid_team = team_qs.filter(plan__isnull=True).count()
-    preview = [team_card(m) for m in team_qs.order_by("-id")[:6]]
+    members = list(team_qs.order_by("-id")[:6])
+    preview = [team_card(m) for m in members]
+    shots = payment_shots([user.id] + [m.id for m in members])
+    for card in preview:
+        card["screenshot"] = shots.get(card["id"])
     slips = [deposit_slip_row(deposit) for deposit in user.deposits.select_related("plan").order_by("-id")[:20]]
     banned = user.account_status == "banned" or bool(user.banned_at)
+    approved_stamp = account_approved_stamp(user)
     return Response({
         "user": member_row(user, light=True),
         "profile": {
@@ -1232,10 +1603,14 @@ def admin_user_detail(request, pk):
             "ban_reason": user.ban_reason or "",
             "banned": banned,
             "plan": user.plan.name if user.plan else "",
+            "plan_amount": money(user.plan.price) if user.plan_id else money(_sum(user.deposits.filter(status=Deposit.APPROVED))),
+            "payment_screenshot": shots.get(user.id),
+            "approved_at": approved_stamp.isoformat() if approved_stamp else None,
         },
         "upliner": person_brief(user.referred_by),
         "team": preview,
         "deposits": slips,
+        "flower_rows": [tx_public(tx) for tx in user.transactions.filter(remark__in=["flower", "flower_add", "flower_sub"]).order_by("-id")[:8]],
     })
 
 
@@ -1252,6 +1627,10 @@ def user_tx_category(qs, category):
         return qs.filter(remark__in=["flower", "flower_add", "flower_sub"])
     if category in ("balance_add", "manual_add"):
         return qs.filter(remark="balance_add", trx_type="+")
+    if category == "bonus":
+        return qs.filter(remark__in=["balance_add", "signup_bonus"], trx_type="+")
+    if category in ("upgrade_referral", "plan_upgrade_referral"):
+        return qs.filter(remark="upgrade_referral", trx_type="+")
     if category in ("balance_sub", "manual_sub"):
         return qs.filter(remark__in=["balance_sub", "balance_subtract"], trx_type="-")
     if category in ("direct", "direct_traffic"):
@@ -1293,6 +1672,8 @@ def tx_page(qs, request):
         item["user_name"] = tx.user.display_name()
         item["user_email"] = tx.user.email
         item["source_user_id"] = found.get((tx.source_email or "").strip().lower())
+        if tx.remark in ("balance_add", "signup_bonus"):
+            item["purpose"] = tx.plan_name or (tx.title.split(":", 1)[1].strip() if ":" in tx.title else "")
         rows.append(item)
     return {
         "total": total,
@@ -1353,7 +1734,7 @@ def admin_user_team(request, pk):
     qs = user.team.select_related("plan")
     paid = (request.GET.get("paid") or "").strip()
     if paid == "1":
-        qs = qs.filter(plan__isnull=False)
+        qs = qs.filter(plan__isnull=False).exclude(account_status="banned")
     elif paid == "0":
         qs = qs.filter(plan__isnull=True)
     plan = (request.GET.get("plan") or "").strip()
@@ -1378,9 +1759,13 @@ def admin_user_team(request, pk):
         counts.append({"name": row["plan__name"] or "No plan", "count": row["count"]})
     page, size = page_bounds(request, 40, 80)
     chunk, count, page, pages = slice_page(qs.order_by("-id"), page, size)
-    payload = paged([team_card(m) for m in chunk], count, page, pages)
+    cards = [team_card(m) for m in chunk]
+    shots = payment_shots([card["id"] for card in cards])
+    for card in cards:
+        card["screenshot"] = shots.get(card["id"])
+    payload = paged(cards, count, page, pages)
     payload["plans"] = counts
-    payload["paid"] = user.team.filter(plan__isnull=False).count()
+    payload["paid"] = user.team.filter(plan__isnull=False).exclude(account_status="banned").count()
     payload["unpaid"] = user.team.filter(plan__isnull=True).count()
     payload["total"] = payload["paid"] + payload["unpaid"]
     return Response(payload)
@@ -1390,15 +1775,69 @@ def admin_user_team(request, pk):
 def leaderboard(request):
     if not require_admin(request):
         return Response(status=403)
-    users = User.objects.filter(role="user", plan__isnull=False).select_related("plan").annotate(active=Count("team"))
+    level_counts = {step: 0 for step in range(1, 11)}
+    active_team = User.objects.filter(
+        referred_by=OuterRef("pk"), plan__isnull=False, account_status="approved",
+    ).order_by().values("referred_by").annotate(total=Count("id")).values("total")
+    level_cases = [
+        When(active_team_count__gte=required, then=Value(step))
+        for step, required in reversed(list(LEVEL_JOININGS.items()))
+    ]
+    base = User.objects.filter(role="user", plan__isnull=False).annotate(
+        active_team_count=Coalesce(Subquery(active_team, output_field=IntegerField()), 0),
+    ).annotate(
+        eligible_level=Case(*level_cases, default=Value(0), output_field=IntegerField()),
+    )
+    for row in base.values("eligible_level").annotate(total=Count("id")):
+        step = row["eligible_level"] or 0
+        if 1 <= step <= 10:
+            level_counts[step] = row["total"]
+    paid_out = Withdrawal.objects.filter(
+        user=OuterRef("pk"), status=Withdrawal.APPROVED,
+    ).order_by().values("user").annotate(total=Sum("amount")).values("total")
+    users = base.select_related("plan").annotate(
+        active_team=F("active_team_count"),
+        earning=Coalesce(Subquery(paid_out, output_field=DecimalField(max_digits=12, decimal_places=2)), Decimal("0")),
+    )
+    raw_level = (request.GET.get("level") or "").strip()
+    if raw_level.isdigit():
+        users = users.filter(eligible_level=int(raw_level))
+    raw_day = (request.GET.get("date") or "").strip()
+    if raw_day:
+        users = between(users, "date_joined", parse_day(raw_day))
+    q = (request.GET.get("q") or "").strip()
+    if q:
+        users = account_search(users, q)
+    sort = (request.GET.get("sort") or "earnings").strip()
+    if sort == "earnings_low":
+        users = users.order_by("earning", "level", "id")
+    elif sort == "level_low":
+        users = users.order_by("level", "earning", "id")
+    elif sort == "level":
+        users = users.order_by("-level", "-earning", "id")
+    else:
+        users = users.order_by("-earning", "-level", "id")
+    page, size = page_bounds(request, 30, 40)
+    chunk, count, page, pages = slice_page(users, page, size)
     rows = []
-    for user in users:
-        row = member_row(user)
-        row["active_team"] = approved_joinings(user).count()
-        row["earnings"] = money(user.transactions.filter(remark__in=["ads", "referral", "restore20", "upgrade_referral"]).aggregate(s=Sum("amount"))["s"] or 0)
-        rows.append(row)
-    rows.sort(key=lambda r: (-r["level"], -r["active_team"], -Decimal(r["earnings"])))
-    return Response(rows)
+    for index, user in enumerate(chunk):
+        rows.append({
+            "id": user.id,
+            "full_name": user.display_name(),
+            "email": user.email,
+            "level": user.eligible_level,
+            "active_team": user.active_team,
+            "earnings": money(user.earning),
+            "serial": (page - 1) * size + index + 1,
+            "joined": user.date_joined.isoformat(),
+        })
+    return Response({
+        "levels": [{"level": step, "count": level_counts[step]} for step in range(1, 11)],
+        "rows": rows,
+        "count": count,
+        "page": page,
+        "pages": pages,
+    })
 
 
 @api_view(["GET"])
@@ -1440,14 +1879,17 @@ def admin_deposits(request):
     chunk, count, page, pages = slice_page(qs, page, size)
     rows = [{
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
-        "username": d.user.username, "phone": d.user.phone or "",
-        "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
-        "sender": d.sender, "status": d.status, "created_at": d.created_at.isoformat(),
+        "username": d.user.username, "code": d.user.referral_code, "phone": d.user.phone or "",
+        "plan_id": d.plan_id, "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
+        "sender": d.sender, "sender_name": d.sender_name or "", "trx_no": d.trx_no or "",
+        "status": d.status, "created_at": d.created_at.isoformat(),
         "reject_reason": d.reject_reason, "approved_at": d.approved_at.isoformat() if d.approved_at else None,
         "screenshot": slip_url("deposits", d.id, d.screenshot),
         "upliner": person_brief(d.user.referred_by),
     } for d in chunk]
-    return Response(paged(rows, count, page, pages))
+    payload = paged(rows, count, page, pages)
+    payload["plans"] = [{"id": plan.id, "name": plan.name, "price": money(plan.price)} for plan in Plan.objects.all()]
+    return Response(payload)
 
 
 @api_view(["GET"])
@@ -1471,6 +1913,7 @@ def upgrade_slip(request, pk):
 
 
 @api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def deposit_action(request, pk):
     if not require_admin(request):
         return Response(status=403)
@@ -1482,6 +1925,48 @@ def deposit_action(request, pk):
         deposit = Deposit.objects.select_for_update().select_related("user", "plan").filter(pk=pk).first()
         if not deposit:
             return Response(status=404)
+        if action == "edit":
+            if deposit.status not in (Deposit.PENDING, Deposit.REJECTED):
+                return Response({"detail": "Only pending or rejected payments can be edited."}, status=400)
+            plan_id = request.data.get("plan_id")
+            plan = Plan.objects.filter(pk=plan_id).first() if str(plan_id or "").isdigit() else None
+            if not plan:
+                return Response({"detail": "Choose a valid plan."}, status=400)
+            try:
+                amount = Decimal(str(request.data.get("amount") or "")).quantize(Decimal("0.01"))
+            except (InvalidOperation, ValueError):
+                return Response({"detail": "Enter a valid payment amount."}, status=400)
+            if not amount.is_finite() or amount <= 0 or amount > Decimal("9999999999.99"):
+                return Response({"detail": "Payment amount must be between 0.01 and 9,999,999,999.99."}, status=400)
+            screenshot = request.FILES.get("screenshot")
+            if screenshot:
+                screenshot = image_upload(screenshot)
+                if not screenshot:
+                    return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+            DepositEditHistory.objects.create(
+                deposit=deposit,
+                editor=request.user,
+                plan_name=deposit.plan.name if deposit.plan else "",
+                amount=deposit.amount,
+                method=deposit.method,
+                sender=deposit.sender,
+                sender_name=deposit.sender_name,
+                trx_no=deposit.trx_no,
+                screenshot_name=deposit.screenshot.name if deposit.screenshot else "",
+            )
+            deposit.plan = plan
+            deposit.amount = amount
+            deposit.method = (request.data.get("method") or "").strip()[:80]
+            deposit.sender = (request.data.get("sender") or "").strip()[:80]
+            deposit.sender_name = (request.data.get("sender_name") or "").strip()[:120]
+            deposit.trx_no = (request.data.get("trx_no") or "").strip()[:80]
+            if screenshot:
+                deposit.screenshot = screenshot
+            deposit.save(update_fields=[
+                "plan", "amount", "method", "sender", "sender_name", "trx_no",
+                "screenshot", "updated_at",
+            ])
+            return Response({"ok": True, "status": deposit.status})
         if action == "approve":
             if deposit.status == Deposit.APPROVED:
                 return Response({"detail": "This payment is already approved."}, status=400)
@@ -1565,10 +2050,17 @@ def withdrawal_action(request, pk):
     if not row:
         return Response(status=404)
     if request.method == "GET":
+        team = row.user.team
+        approved = team.filter(plan__isnull=False, account_status="approved").count()
+        paid = team.filter(plan__isnull=False).exclude(account_status="banned").count()
+        unpaid = team.filter(plan__isnull=True).count()
         return Response({
             "account": person_brief(row.user),
             "upliner": person_brief(row.user.referred_by),
-            "team": team_pack(row.user),
+            "plan": row.user.plan.name if row.user.plan_id else "No plan",
+            "joined": row.user.date_joined.isoformat(),
+            "requested_at": row.created_at.isoformat(),
+            "team": {"approved": approved, "paid": paid, "unpaid": unpaid, "total": approved},
         })
     action = request.data.get("action")
     remark = (request.data.get("reason") or request.data.get("remark") or "").strip()
@@ -1599,9 +2091,34 @@ def admin_upgrades(request):
     if not require_admin(request):
         return Response(status=403)
     status = request.GET.get("status") or "pending"
-    rows = UpgradeRequest.objects.select_related("user", "from_plan", "to_plan").order_by("-id")
+    rows = UpgradeRequest.objects.select_related("user", "user__referred_by", "from_plan", "to_plan").order_by("-id")
     if status != "all":
         rows = rows.filter(status=status)
+    raw_day = (request.GET.get("date") or "").strip()
+    if raw_day:
+        chosen = parse_day(raw_day)
+        start, end = day_window(chosen)
+        approved_date = (
+            Q(approved_at__gte=start, approved_at__lt=end)
+            | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
+            | Q(approved_at__isnull=True, updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+        )
+        rejected_date = (
+            Q(updated_at__gte=start, updated_at__lt=end)
+            | Q(updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+        )
+        if status == "approved":
+            rows = rows.filter(approved_date)
+        elif status == "rejected":
+            rows = rows.filter(rejected_date)
+        elif status == "pending":
+            rows = between(rows, "created_at", chosen)
+        else:
+            rows = rows.filter(
+                Q(status=UpgradeRequest.PENDING, created_at__gte=start, created_at__lt=end)
+                | Q(status=UpgradeRequest.APPROVED) & approved_date
+                | Q(status=UpgradeRequest.REJECTED) & rejected_date
+            )
     rows = related_search(rows, request.GET.get("q"), extras=("sender",))
     if request.GET.get("suggest") == "1":
         seen = []
@@ -1620,7 +2137,8 @@ def admin_upgrades(request):
         "id": r.id, "user_id": r.user_id, "full_name": r.user.display_name(), "email": r.user.email,
         "from_plan": r.from_plan.name if r.from_plan else "—", "to_plan": r.to_plan.name if r.to_plan else "—",
         "plan": r.to_plan.name if r.to_plan else "—", "amount": money(r.amount), "method": r.method,
-        "sender": r.sender, "status": r.status, "reject_reason": r.reject_reason,
+        "sender": r.sender, "sender_name": r.sender_name or "", "trx_no": r.trx_no or "",
+        "status": r.status, "reject_reason": r.reject_reason,
         "old_paid": money(r.from_plan.price) if r.from_plan else "0.00",
         "additional": money((r.to_plan.price - r.from_plan.price) if r.from_plan and r.to_plan and r.to_plan.price > r.from_plan.price else r.amount),
         "username": r.user.username, "phone": r.user.phone or "",
@@ -1693,9 +2211,9 @@ def admin_channels(request):
             picture = image_upload(picture)
             if not picture:
                 return Response({"detail": "Channel image must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
-        link = (request.data.get("link") or "https://flowersblom.com").strip()
+        link = (request.data.get("link") or "https://flowerblom.com").strip()
         if not link.startswith("https://") and not link.startswith("http://"):
-            link = "https://flowersblom.com"
+            link = "https://flowerblom.com"
         channel = Channel.objects.create(
             title=request.data.get("title") or "Channel",
             purpose=request.data.get("purpose") or "",
@@ -1715,7 +2233,18 @@ def admin_channels(request):
 def admin_contacts(request):
     if not require_admin(request):
         return Response(status=403)
-    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
+    return Response([{
+        "id": c.id,
+        "name": c.name,
+        "role": c.role,
+        "whatsapp": c.whatsapp if c.number_type != "botim" or c.botim else "",
+        "botim": c.botim or (c.whatsapp if c.number_type == "botim" else ""),
+        "note": c.note,
+        "purpose": c.purpose,
+        "number_type": c.number_type or "whatsapp",
+        "whatsapp_icon": media_url(c.whatsapp_icon),
+        "botim_icon": media_url(c.botim_icon),
+    } for c in ContactAdmin.objects.all()])
 
 
 @api_view(["GET", "POST"])
@@ -1739,6 +2268,8 @@ def admin_gateways(request):
         gateway.name = name
         gateway.account_name = account_name
         gateway.account_number = account_number
+        if "instructions" in request.data:
+            gateway.instructions = request.data.get("instructions") or ""
         if "active" in request.data:
             gateway.active = str(request.data.get("active")).lower() in ("1", "true", "on", "yes")
         picture = request.FILES.get("image")

@@ -14,6 +14,7 @@ TASK_RATES = {
 }
 LEVEL_JOININGS = {1: 3, 2: 12, 3: 27, 4: 150, 5: 220, 6: 370, 7: 500, 8: 1000}
 FLOWER_AMOUNT = Decimal("200.00")
+SIGNUP_BONUS = Decimal("50.00")
 PLAN_TASKS = {"basic": 1, "gold": 2, "standard": 4, "premium": 6, "super premium": 10}
 
 
@@ -37,15 +38,22 @@ def task_rate(level):
 
 
 def cycle_status(level, joining_count, started_at, latest_joining_at, now):
-    # Below level 2, the first period is 15 days. Level 2 and above always use 7 days.
-    if joining_count <= 0 and level < 2:
-        days = 15
-        start = started_at
-        kind = "initial"
-    else:
-        days = 7
-        start = latest_joining_at or started_at
-        kind = "joining"
-    end = start + timedelta(days=days)
+    # Before Level 1 the account has 15 free days. One approved joining keeps tasks open until Level 1.
+    # Level 1 and above use seven days from the latest approved joining.
+    if level < 1:
+        end = started_at + timedelta(days=15)
+        inside = now <= end
+        kept_open = joining_count > 0 and not inside
+        remaining = max(0, int((end - now).total_seconds())) if inside else 0
+        return {
+            "locked": not (inside or joining_count > 0),
+            "days": 15,
+            "ends": end,
+            "remaining": remaining,
+            "kind": "initial",
+            "kept_open": kept_open,
+        }
+    start = latest_joining_at or started_at
+    end = start + timedelta(days=7)
     remaining = max(0, int((end - now).total_seconds()))
-    return {"locked": now > end, "days": days, "ends": end, "remaining": remaining, "kind": kind}
+    return {"locked": now > end, "days": 7, "ends": end, "remaining": remaining, "kind": "joining", "kept_open": False}

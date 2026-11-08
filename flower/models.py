@@ -30,6 +30,8 @@ class User(AbstractUser):
     flower_balance = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     flower_credited = models.BooleanField(default=False)
     activated_at = models.DateTimeField(null=True, blank=True)
+    channels_confirmed_at = models.DateTimeField(null=True, blank=True)
+    channels_day = models.DateField(null=True, blank=True)
     ban_reason = models.TextField(blank=True, default="")
     banned_at = models.DateTimeField(null=True, blank=True)
 
@@ -37,6 +39,8 @@ class User(AbstractUser):
         return self.full_name or self.username
 
     class Meta:
+        verbose_name = "user"
+        verbose_name_plural = "users"
         indexes = [
             models.Index(fields=["email"], name="flower_user_email_idx"),
             models.Index(fields=["account_status"], name="flower_user_acct_status"),
@@ -77,15 +81,19 @@ class ContactAdmin(models.Model):
     name = models.CharField(max_length=120)
     role = models.CharField(max_length=120, blank=True)
     whatsapp = models.CharField(max_length=40, blank=True)
+    botim = models.CharField(max_length=40, blank=True, default="")
     note = models.CharField(max_length=255, blank=True)
     purpose = models.CharField(max_length=255, blank=True, default="")
     number_type = models.CharField(max_length=20, default="whatsapp")
+    whatsapp_icon = models.FileField(upload_to="contacts/", blank=True, null=True)
+    botim_icon = models.FileField(upload_to="contacts/", blank=True, null=True)
 
 
 class Gateway(models.Model):
     name = models.CharField(max_length=80)
     account_name = models.CharField(max_length=120, blank=True)
     account_number = models.CharField(max_length=80, blank=True)
+    instructions = models.TextField(blank=True, default="")
     active = models.BooleanField(default=True)
     image = models.FileField(upload_to="gateways/", blank=True, null=True)
 
@@ -106,6 +114,7 @@ class Task(models.Model):
     detail = models.CharField(max_length=255, blank=True)
     reward = models.DecimalField(max_digits=10, decimal_places=2, default=10)
     active = models.BooleanField(default=True)
+    display_only = models.BooleanField(default=False)
 
 
 class TaskDone(models.Model):
@@ -115,6 +124,18 @@ class TaskDone(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=["user", "created_at"], name="flower_taskdone_user_created")]
+
+
+class DisplayBloom(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    task = models.ForeignKey(Task, on_delete=models.CASCADE)
+    day = models.DateField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "task", "day"], name="flower_display_daily"),
+        ]
 
 
 class TaskClaim(models.Model):
@@ -137,6 +158,8 @@ class Deposit(models.Model):
     amount = models.DecimalField(max_digits=12, decimal_places=2)
     method = models.CharField(max_length=80, blank=True)
     sender = models.CharField(max_length=80, blank=True)
+    sender_name = models.CharField(max_length=120, blank=True, default="")
+    trx_no = models.CharField(max_length=80, blank=True, default="")
     screenshot = models.FileField(upload_to="payments/", blank=True, null=True)
     status = models.CharField(max_length=20, default=PENDING)
     reject_reason = models.TextField(blank=True, default="")
@@ -146,6 +169,19 @@ class Deposit(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=["status", "id"], name="flower_deposit_status_id")]
+
+
+class DepositEditHistory(models.Model):
+    deposit = models.ForeignKey(Deposit, on_delete=models.CASCADE, related_name="edit_history")
+    editor = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    plan_name = models.CharField(max_length=80, blank=True)
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    method = models.CharField(max_length=80, blank=True)
+    sender = models.CharField(max_length=80, blank=True)
+    sender_name = models.CharField(max_length=120, blank=True)
+    trx_no = models.CharField(max_length=80, blank=True)
+    screenshot_name = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class Withdrawal(models.Model):
@@ -177,11 +213,14 @@ class UpgradeRequest(models.Model):
     amount = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     method = models.CharField(max_length=80, blank=True)
     sender = models.CharField(max_length=80, blank=True)
+    sender_name = models.CharField(max_length=120, blank=True, default="")
+    trx_no = models.CharField(max_length=80, blank=True, default="")
     screenshot = models.FileField(upload_to="payments/", blank=True, null=True)
     status = models.CharField(max_length=20, default=PENDING)
     reject_reason = models.TextField(blank=True, default="")
     pay_commission = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
     approved_at = models.DateTimeField(null=True, blank=True)
 
 

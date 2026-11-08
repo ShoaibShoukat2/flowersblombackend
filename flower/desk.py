@@ -5,7 +5,8 @@ from decimal import Decimal, InvalidOperation
 from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
-from rest_framework.decorators import api_view, parser_classes
+from rest_framework.decorators import api_view, parser_classes, permission_classes
+from rest_framework.permissions import AllowAny
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
@@ -13,7 +14,15 @@ from .models import (
     AdminSession, BalanceAdjustment, Channel, ContactAdmin, Deposit, Gateway,
     ImpersonationGrant, Plan, SiteSetting, Transaction, UpgradeRequest, User, Withdrawal,
 )
-from .views import activate_member, approved_deposits_on, image_upload, media_url, money, parse_day, person_brief, user_payload
+from .views import activate_member, approved_deposits_on, between, day_window, image_upload, media_url, money, parse_day, person_brief, sync_level, user_payload
+
+
+def refresh_upline_count(parent_id):
+    if not parent_id:
+        return
+    parent = User.objects.filter(pk=parent_id, role="user").first()
+    if parent:
+        sync_level(parent)
 
 
 def require_admin(request):
@@ -80,11 +89,11 @@ def adjust_balance(request, pk):
         else:
             user.balance = after
             user.save(update_fields=["balance"])
-            title = "Balance added" if kind.endswith("_add") else "Balance subtracted"
+            title = "Bonus" if kind.endswith("_add") else "Balance subtracted"
             remark = "balance_add" if kind.endswith("_add") else "balance_sub"
         Transaction.objects.create(
             user=user, amount=amount, trx_type="+" if kind.endswith("_add") else "-",
-            title=f"{title}: {reason[:80]}", remark=remark,
+            title=title, remark=remark, plan_name=reason[:80],
         )
         BalanceAdjustment.objects.create(
             user=user, admin=request.user, kind=kind, amount=amount, reason=reason,
@@ -101,11 +110,13 @@ def ban_user(request, pk):
     if not user:
         return Response(status=404)
     action = (request.data.get("action") or "ban").strip().lower()
+    parent_id = user.referred_by_id
     if action == "unban":
         user.account_status = "approved" if user.plan_id else "pending"
         user.ban_reason = ""
         user.banned_at = None
         user.save(update_fields=["account_status", "ban_reason", "banned_at"])
+        refresh_upline_count(parent_id)
         return Response({"ok": True, "status": user.account_status, "banned": False})
     reason = (request.data.get("reason") or "").strip()
     if not reason:
@@ -114,6 +125,7 @@ def ban_user(request, pk):
     user.ban_reason = reason
     user.banned_at = timezone.now()
     user.save(update_fields=["account_status", "ban_reason", "banned_at"])
+    refresh_upline_count(parent_id)
     return Response({"ok": True, "status": "banned", "banned": True})
 
 
@@ -147,6 +159,7 @@ def impersonate(request, pk):
 
 
 @api_view(["POST"])
+@permission_classes([AllowAny])
 def impersonate_exchange(request):
     code = (request.data.get("code") or "").strip()
     grant = ImpersonationGrant.objects.select_related("user").filter(code=code, used_at__isnull=True).first()
@@ -281,15 +294,30 @@ def today_approved(request):
 def upgrade_board(request):
     if not require_admin(request):
         return Response(status=403)
-    today = timezone.localdate()
+    raw = (request.GET.get("date") or "today").strip()
+    day = parse_day(raw)
+    start, end = day_window(day)
     approved = UpgradeRequest.objects.filter(status=UpgradeRequest.APPROVED)
-    approved_today = approved.filter(approved_at__date=today)
+    approved_on = approved.filter(
+        Q(approved_at__gte=start, approved_at__lt=end)
+        | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
+        | Q(approved_at__isnull=True, updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+    )
+    pending_on = between(UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING), "created_at", day)
+    rejected_on = UpgradeRequest.objects.filter(status=UpgradeRequest.REJECTED).filter(
+        Q(updated_at__gte=start, updated_at__lt=end)
+        | Q(updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
+    )
     return Response({
-        "today_count": approved_today.count(),
-        "today_receive": money(_sum(approved_today)),
-        "pending": UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING).count(),
-        "approved": approved.count(),
-        "rejected": UpgradeRequest.objects.filter(status=UpgradeRequest.REJECTED).count(),
+        "date": day.isoformat(),
+        "today_count": approved_on.count(),
+        "today_receive": money(_sum(approved_on)),
+        "pending": pending_on.count(),
+        "approved": approved_on.count(),
+        "rejected": rejected_on.count(),
+        "all_pending": UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING).count(),
+        "all_approved": UpgradeRequest.objects.filter(status=UpgradeRequest.APPROVED).count(),
+        "all_rejected": UpgradeRequest.objects.filter(status=UpgradeRequest.REJECTED).count(),
         "commission_percent": money(SiteSetting.current().upgrade_commission_percent),
         "commission_base": "Additional payment = new plan price minus current plan price. 20% of that amount goes to the direct upliner only when Yes is selected.",
     })
@@ -308,6 +336,7 @@ def channel_edit(request, pk):
         return Response({"ok": True})
     channel.title = request.data.get("title") or channel.title
     channel.purpose = request.data.get("purpose") if "purpose" in request.data else channel.purpose
+    channel.description = request.data.get("description") if "description" in request.data else channel.description
     link = (request.data.get("link") or channel.link).strip()
     if link.startswith("http://") or link.startswith("https://"):
         channel.link = link
@@ -322,6 +351,7 @@ def channel_edit(request, pk):
 
 
 @api_view(["POST"])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def contact_save(request):
     if not require_admin(request):
         return Response(status=403)
@@ -338,12 +368,30 @@ def contact_save(request):
         row = ContactAdmin()
     if not row:
         return Response(status=404)
-    row.name = request.data.get("name") or row.name or "Admin"
-    row.role = request.data.get("role") or request.data.get("instructions") or row.role
-    row.note = request.data.get("instructions") or request.data.get("note") or row.note
-    row.purpose = request.data.get("purpose") or row.purpose
-    row.whatsapp = request.data.get("number") or request.data.get("whatsapp") or row.whatsapp
-    row.number_type = number_type
+    row.name = (request.data.get("name") or row.name or "Admin").strip()[:120]
+    if "role" in request.data or "purpose" in request.data:
+        row.role = (request.data.get("role") or request.data.get("purpose") or "").strip()[:120]
+    if "note" in request.data or "instructions" in request.data:
+        row.note = (request.data.get("instructions") or request.data.get("note") or "").strip()[:255]
+    if "purpose" in request.data:
+        row.purpose = (request.data.get("purpose") or "").strip()[:255]
+    if "whatsapp" in request.data:
+        row.whatsapp = (request.data.get("whatsapp") or "").strip()[:40]
+    elif "number" in request.data:
+        if number_type == "botim":
+            row.botim = (request.data.get("number") or "").strip()[:40]
+        else:
+            row.whatsapp = (request.data.get("number") or "").strip()[:40]
+    if "botim" in request.data:
+        row.botim = (request.data.get("botim") or "").strip()[:40]
+    for field in ("whatsapp_icon", "botim_icon"):
+        picture = request.FILES.get(field)
+        if picture:
+            picture = image_upload(picture)
+            if not picture:
+                return Response({"detail": "Contact icon must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
+            setattr(row, field, picture)
+    row.number_type = "whatsapp"
     row.save()
     return Response({"id": row.id})
 

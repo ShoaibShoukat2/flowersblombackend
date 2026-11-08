@@ -4,7 +4,11 @@ from . import desk, views
 urlpatterns = [
     path("auth/login", views.login),
     path("auth/register", views.register),
+    path("auth/referrer", views.referrer),
     path("me", views.me),
+    path("user/gate", views.account_gate),
+    path("user/channels/confirm", views.confirm_channels),
+    path("user/channels/daily", views.confirm_daily_channels),
     path("user/home", views.user_home),
     path("user/tasks", views.tasks),
     path("user/tasks/<int:pk>/complete", views.complete_task),
