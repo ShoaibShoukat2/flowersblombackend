@@ -6,7 +6,7 @@ from django.core.cache import cache
 from django.db import IntegrityError, transaction
 import re
 
-from django.db.models import Case, Count, DecimalField, F, IntegerField, OuterRef, Q, Subquery, Sum, Value, When
+from django.db.models import Count, DecimalField, IntegerField, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce, Lower
 from django.http import FileResponse
 from django.utils import timezone
@@ -18,7 +18,7 @@ from rest_framework.response import Response
 
 from .levels import FLOWER_AMOUNT, LEVEL_JOININGS, SIGNUP_BONUS, cycle_status, level_for_joinings, next_level_target, task_rate
 from .models import (
-    Channel, ContactAdmin, Deposit, DepositEditHistory, DisplayBloom, Gateway, Plan, Reward, SiteSetting,
+    Channel, ContactAdmin, Deposit, DisplayBloom, Gateway, Plan, Reward, SiteSetting,
     Task, TaskClaim, TaskDone, Transaction, UpgradeRequest, User, Withdrawal,
 )
 
@@ -447,9 +447,7 @@ def official_channels():
             "id": channel.id,
             "title": channel.title,
             "purpose": channel.purpose,
-            "description": channel.description,
             "link": channel.link,
-            "image": media_url(channel.image),
         })
     return rows
 
@@ -922,18 +920,7 @@ def contacts(request):
     blocked = user_guard(request)
     if blocked:
         return blocked
-    return Response([{
-        "id": c.id,
-        "name": c.name,
-        "role": c.role,
-        "whatsapp": c.whatsapp if c.number_type != "botim" or c.botim else "",
-        "botim": c.botim or (c.whatsapp if c.number_type == "botim" else ""),
-        "note": c.note,
-        "purpose": c.purpose,
-        "number_type": c.number_type or "whatsapp",
-        "whatsapp_icon": media_url(c.whatsapp_icon),
-        "botim_icon": media_url(c.botim_icon),
-    } for c in ContactAdmin.objects.all()])
+    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
 
 
 def canonical_gateway_name(name):
@@ -1776,35 +1763,29 @@ def leaderboard(request):
     if not require_admin(request):
         return Response(status=403)
     level_counts = {step: 0 for step in range(1, 11)}
-    active_team = User.objects.filter(
-        referred_by=OuterRef("pk"), plan__isnull=False, account_status="approved",
-    ).order_by().values("referred_by").annotate(total=Count("id")).values("total")
-    level_cases = [
-        When(active_team_count__gte=required, then=Value(step))
-        for step, required in reversed(list(LEVEL_JOININGS.items()))
-    ]
-    base = User.objects.filter(role="user", plan__isnull=False).annotate(
-        active_team_count=Coalesce(Subquery(active_team, output_field=IntegerField()), 0),
-    ).annotate(
-        eligible_level=Case(*level_cases, default=Value(0), output_field=IntegerField()),
-    )
-    for row in base.values("eligible_level").annotate(total=Count("id")):
-        step = row["eligible_level"] or 0
+    for row in User.objects.filter(role="user").values("level").annotate(total=Count("id")):
+        step = row["level"] or 0
         if 1 <= step <= 10:
             level_counts[step] = row["total"]
+    team_count = User.objects.filter(
+        referred_by=OuterRef("pk"), plan__isnull=False, account_status="approved",
+    ).order_by().values("referred_by").annotate(total=Count("id")).values("total")
     paid_out = Withdrawal.objects.filter(
         user=OuterRef("pk"), status=Withdrawal.APPROVED,
     ).order_by().values("user").annotate(total=Sum("amount")).values("total")
-    users = base.select_related("plan").annotate(
-        active_team=F("active_team_count"),
+    users = User.objects.filter(role="user", plan__isnull=False).select_related("plan").annotate(
+        active_team=Coalesce(Subquery(team_count, output_field=IntegerField()), 0),
         earning=Coalesce(Subquery(paid_out, output_field=DecimalField(max_digits=12, decimal_places=2)), Decimal("0")),
     )
     raw_level = (request.GET.get("level") or "").strip()
     if raw_level.isdigit():
-        users = users.filter(eligible_level=int(raw_level))
+        users = users.filter(level=int(raw_level))
     raw_day = (request.GET.get("date") or "").strip()
     if raw_day:
         users = between(users, "date_joined", parse_day(raw_day))
+    raw_time = (request.GET.get("time") or "").strip()
+    if len(raw_time) >= 2 and raw_time[:2].isdigit():
+        users = users.filter(date_joined__hour=int(raw_time[:2]))
     q = (request.GET.get("q") or "").strip()
     if q:
         users = account_search(users, q)
@@ -1825,7 +1806,7 @@ def leaderboard(request):
             "id": user.id,
             "full_name": user.display_name(),
             "email": user.email,
-            "level": user.eligible_level,
+            "level": user.level,
             "active_team": user.active_team,
             "earnings": money(user.earning),
             "serial": (page - 1) * size + index + 1,
@@ -1880,16 +1861,14 @@ def admin_deposits(request):
     rows = [{
         "id": d.id, "user_id": d.user_id, "full_name": d.user.display_name(), "email": d.user.email,
         "username": d.user.username, "code": d.user.referral_code, "phone": d.user.phone or "",
-        "plan_id": d.plan_id, "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
+        "plan": d.plan.name if d.plan else None, "amount": money(d.amount), "method": d.method,
         "sender": d.sender, "sender_name": d.sender_name or "", "trx_no": d.trx_no or "",
         "status": d.status, "created_at": d.created_at.isoformat(),
         "reject_reason": d.reject_reason, "approved_at": d.approved_at.isoformat() if d.approved_at else None,
         "screenshot": slip_url("deposits", d.id, d.screenshot),
         "upliner": person_brief(d.user.referred_by),
     } for d in chunk]
-    payload = paged(rows, count, page, pages)
-    payload["plans"] = [{"id": plan.id, "name": plan.name, "price": money(plan.price)} for plan in Plan.objects.all()]
-    return Response(payload)
+    return Response(paged(rows, count, page, pages))
 
 
 @api_view(["GET"])
@@ -1913,7 +1892,6 @@ def upgrade_slip(request, pk):
 
 
 @api_view(["POST"])
-@parser_classes([MultiPartParser, FormParser, JSONParser])
 def deposit_action(request, pk):
     if not require_admin(request):
         return Response(status=403)
@@ -1925,48 +1903,6 @@ def deposit_action(request, pk):
         deposit = Deposit.objects.select_for_update().select_related("user", "plan").filter(pk=pk).first()
         if not deposit:
             return Response(status=404)
-        if action == "edit":
-            if deposit.status not in (Deposit.PENDING, Deposit.REJECTED):
-                return Response({"detail": "Only pending or rejected payments can be edited."}, status=400)
-            plan_id = request.data.get("plan_id")
-            plan = Plan.objects.filter(pk=plan_id).first() if str(plan_id or "").isdigit() else None
-            if not plan:
-                return Response({"detail": "Choose a valid plan."}, status=400)
-            try:
-                amount = Decimal(str(request.data.get("amount") or "")).quantize(Decimal("0.01"))
-            except (InvalidOperation, ValueError):
-                return Response({"detail": "Enter a valid payment amount."}, status=400)
-            if not amount.is_finite() or amount <= 0 or amount > Decimal("9999999999.99"):
-                return Response({"detail": "Payment amount must be between 0.01 and 9,999,999,999.99."}, status=400)
-            screenshot = request.FILES.get("screenshot")
-            if screenshot:
-                screenshot = image_upload(screenshot)
-                if not screenshot:
-                    return Response({"detail": "Payment screenshot must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
-            DepositEditHistory.objects.create(
-                deposit=deposit,
-                editor=request.user,
-                plan_name=deposit.plan.name if deposit.plan else "",
-                amount=deposit.amount,
-                method=deposit.method,
-                sender=deposit.sender,
-                sender_name=deposit.sender_name,
-                trx_no=deposit.trx_no,
-                screenshot_name=deposit.screenshot.name if deposit.screenshot else "",
-            )
-            deposit.plan = plan
-            deposit.amount = amount
-            deposit.method = (request.data.get("method") or "").strip()[:80]
-            deposit.sender = (request.data.get("sender") or "").strip()[:80]
-            deposit.sender_name = (request.data.get("sender_name") or "").strip()[:120]
-            deposit.trx_no = (request.data.get("trx_no") or "").strip()[:80]
-            if screenshot:
-                deposit.screenshot = screenshot
-            deposit.save(update_fields=[
-                "plan", "amount", "method", "sender", "sender_name", "trx_no",
-                "screenshot", "updated_at",
-            ])
-            return Response({"ok": True, "status": deposit.status})
         if action == "approve":
             if deposit.status == Deposit.APPROVED:
                 return Response({"detail": "This payment is already approved."}, status=400)
@@ -2097,28 +2033,16 @@ def admin_upgrades(request):
     raw_day = (request.GET.get("date") or "").strip()
     if raw_day:
         chosen = parse_day(raw_day)
-        start, end = day_window(chosen)
-        approved_date = (
-            Q(approved_at__gte=start, approved_at__lt=end)
-            | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
-            | Q(approved_at__isnull=True, updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
-        )
-        rejected_date = (
-            Q(updated_at__gte=start, updated_at__lt=end)
-            | Q(updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
-        )
         if status == "approved":
-            rows = rows.filter(approved_date)
-        elif status == "rejected":
-            rows = rows.filter(rejected_date)
-        elif status == "pending":
-            rows = between(rows, "created_at", chosen)
-        else:
+            start, end = day_window(chosen)
             rows = rows.filter(
-                Q(status=UpgradeRequest.PENDING, created_at__gte=start, created_at__lt=end)
-                | Q(status=UpgradeRequest.APPROVED) & approved_date
-                | Q(status=UpgradeRequest.REJECTED) & rejected_date
+                Q(approved_at__gte=start, approved_at__lt=end)
+                | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
             )
+        elif status == "rejected":
+            rows = between(rows, "updated_at", chosen)
+        else:
+            rows = between(rows, "created_at", chosen)
     rows = related_search(rows, request.GET.get("q"), extras=("sender",))
     if request.GET.get("suggest") == "1":
         seen = []
@@ -2233,18 +2157,7 @@ def admin_channels(request):
 def admin_contacts(request):
     if not require_admin(request):
         return Response(status=403)
-    return Response([{
-        "id": c.id,
-        "name": c.name,
-        "role": c.role,
-        "whatsapp": c.whatsapp if c.number_type != "botim" or c.botim else "",
-        "botim": c.botim or (c.whatsapp if c.number_type == "botim" else ""),
-        "note": c.note,
-        "purpose": c.purpose,
-        "number_type": c.number_type or "whatsapp",
-        "whatsapp_icon": media_url(c.whatsapp_icon),
-        "botim_icon": media_url(c.botim_icon),
-    } for c in ContactAdmin.objects.all()])
+    return Response([{"id": c.id, "name": c.name, "role": c.role, "whatsapp": c.whatsapp, "note": c.note, "purpose": c.purpose, "number_type": c.number_type or "whatsapp"} for c in ContactAdmin.objects.all()])
 
 
 @api_view(["GET", "POST"])
