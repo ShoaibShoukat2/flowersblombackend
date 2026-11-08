@@ -301,13 +301,9 @@ def upgrade_board(request):
     approved_on = approved.filter(
         Q(approved_at__gte=start, approved_at__lt=end)
         | Q(approved_at__isnull=True, updated_at__gte=start, updated_at__lt=end)
-        | Q(approved_at__isnull=True, updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
     )
     pending_on = between(UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING), "created_at", day)
-    rejected_on = UpgradeRequest.objects.filter(status=UpgradeRequest.REJECTED).filter(
-        Q(updated_at__gte=start, updated_at__lt=end)
-        | Q(updated_at__isnull=True, created_at__gte=start, created_at__lt=end)
-    )
+    rejected_on = between(UpgradeRequest.objects.filter(status=UpgradeRequest.REJECTED), "updated_at", day)
     return Response({
         "date": day.isoformat(),
         "today_count": approved_on.count(),
@@ -315,9 +311,6 @@ def upgrade_board(request):
         "pending": pending_on.count(),
         "approved": approved_on.count(),
         "rejected": rejected_on.count(),
-        "all_pending": UpgradeRequest.objects.filter(status=UpgradeRequest.PENDING).count(),
-        "all_approved": UpgradeRequest.objects.filter(status=UpgradeRequest.APPROVED).count(),
-        "all_rejected": UpgradeRequest.objects.filter(status=UpgradeRequest.REJECTED).count(),
         "commission_percent": money(SiteSetting.current().upgrade_commission_percent),
         "commission_base": "Additional payment = new plan price minus current plan price. 20% of that amount goes to the direct upliner only when Yes is selected.",
     })
@@ -336,7 +329,6 @@ def channel_edit(request, pk):
         return Response({"ok": True})
     channel.title = request.data.get("title") or channel.title
     channel.purpose = request.data.get("purpose") if "purpose" in request.data else channel.purpose
-    channel.description = request.data.get("description") if "description" in request.data else channel.description
     link = (request.data.get("link") or channel.link).strip()
     if link.startswith("http://") or link.startswith("https://"):
         channel.link = link
@@ -351,7 +343,6 @@ def channel_edit(request, pk):
 
 
 @api_view(["POST"])
-@parser_classes([MultiPartParser, FormParser, JSONParser])
 def contact_save(request):
     if not require_admin(request):
         return Response(status=403)
@@ -368,30 +359,12 @@ def contact_save(request):
         row = ContactAdmin()
     if not row:
         return Response(status=404)
-    row.name = (request.data.get("name") or row.name or "Admin").strip()[:120]
-    if "role" in request.data or "purpose" in request.data:
-        row.role = (request.data.get("role") or request.data.get("purpose") or "").strip()[:120]
-    if "note" in request.data or "instructions" in request.data:
-        row.note = (request.data.get("instructions") or request.data.get("note") or "").strip()[:255]
-    if "purpose" in request.data:
-        row.purpose = (request.data.get("purpose") or "").strip()[:255]
-    if "whatsapp" in request.data:
-        row.whatsapp = (request.data.get("whatsapp") or "").strip()[:40]
-    elif "number" in request.data:
-        if number_type == "botim":
-            row.botim = (request.data.get("number") or "").strip()[:40]
-        else:
-            row.whatsapp = (request.data.get("number") or "").strip()[:40]
-    if "botim" in request.data:
-        row.botim = (request.data.get("botim") or "").strip()[:40]
-    for field in ("whatsapp_icon", "botim_icon"):
-        picture = request.FILES.get(field)
-        if picture:
-            picture = image_upload(picture)
-            if not picture:
-                return Response({"detail": "Contact icon must be a JPG, PNG, or WEBP image under 8 MB."}, status=400)
-            setattr(row, field, picture)
-    row.number_type = "whatsapp"
+    row.name = request.data.get("name") or row.name or "Admin"
+    row.role = request.data.get("role") or request.data.get("instructions") or row.role
+    row.note = request.data.get("instructions") or request.data.get("note") or row.note
+    row.purpose = request.data.get("purpose") or row.purpose
+    row.whatsapp = request.data.get("number") or request.data.get("whatsapp") or row.whatsapp
+    row.number_type = number_type
     row.save()
     return Response({"id": row.id})
 
